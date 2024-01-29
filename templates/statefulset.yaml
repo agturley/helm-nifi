@@ -183,14 +183,6 @@ spec:
           bin/nifi.sh set-single-user-credentials {{ .Values.auth.singleUser.username }} {{ .Values.auth.singleUser.password }}
 {{- end }}
 
-{{ if .Values.customFlow }}
-          gzip < {{ .Values.customFlow }} > /opt/nifi/data/flow.xml.gz
-{{ else }}
-          if ! test -f /opt/nifi/data/flow.xml.gz && test -f /opt/nifi/data/flow.xml; then
-            gzip /opt/nifi/data/flow.xml
-          fi
-{{ end }}
-
           prop_replace nifi.ui.banner.text $(hostname -s)
           prop_replace nifi.remote.input.host ${FQDN}
           prop_replace nifi.cluster.node.address ${FQDN}
@@ -227,7 +219,6 @@ spec:
           prop_replace nifi.security.truststore "${NIFI_HOME}/tls/truststore.jks"
           prop_replace nifi.security.truststoreType JKS
           prop_replace nifi.security.truststorePasswd "{{ .Values.certManager.truststorePasswd }}"
-
           prop_replace nifi.web.https.host "$(hostname).{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}"
           prop_replace nifi.cluster.node.address "$(hostname).{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}"
           prop_replace nifi.web.https.network.interface.default eth0

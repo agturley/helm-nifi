@@ -124,10 +124,10 @@
         <property name="Authentication Strategy">SIMPLE</property>
         <property name="Manager DN">{{.Values.auth.ldap.admin}}</property>
         <property name="Manager Password">{{.Values.auth.ldap.pass}}</property>
-        <property name="TLS - Keystore">/opt/nifi/nifi-current/conf/{{.Release.Name}}-nifi-0.{{.Release.Name}}-nifi-headless.{{.Values.properties.namespace}}.svc.cluster.local/keystore.jks</property>
+        <property name="TLS - Keystore">/opt/nifi/nifi-current/tls/keystore.jks</property>
         <property name="TLS - Keystore Password">{{.Values.auth.SSL.keystorePasswd}}</property>
         <property name="TLS - Keystore Type">jks</property>
-        <property name="TLS - Truststore">/opt/nifi/nifi-current/conf/{{.Release.Name}}-nifi-0.{{.Release.Name}}-nifi-headless.{{.Values.properties.namespace}}.svc.cluster.local/truststore.jks</property>
+        <property name="TLS - Truststore">/opt/nifi/nifi-current/tls/truststore.jks</property>
         <property name="TLS - Truststore Password">{{.Values.auth.SSL.truststorePasswd}}</property>
         <property name="TLS - Truststore Type">JKS</property>
         <property name="TLS - Client Auth">NONE</property>
@@ -268,15 +268,4 @@
             NOTE: Any identity mapping rules specified in nifi.properties will also be applied to the node identities,
             so the values should be the unmapped identities (i.e. full DN from a certificate).
     -->
-    {{- if .Values.auth.ldap.enabled}}
-    <authorizer>
-        <identifier>file-provider</identifier>
-        <class>org.apache.nifi.authorization.FileAuthorizer</class>
-        <property name="Authorizations File">./auth-conf/authorizations.xml</property>
-        <property name="Users File">./auth-conf/users.xml</property>
-        <property name="Initial Admin Identity">{{.Values.auth.ldap.admin}}</property>
-        <property name="Legacy Authorized Users File"></property>
-
-    </authorizer>
-    {{- end}}
 </authorizers>
