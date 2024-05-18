@@ -148,13 +148,13 @@ spec:
           {{- if .Values.properties.UseK8sSecrets }}
           xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='TLS - Keystore Password']" -v ${NIFI_TLS_KEYSTORE_PASSWORD} "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='TLS - Truststore Password']" -v ${NIFI_TLS_TRUSTSTORE_PASSWORD} "${NIFI_HOME}/conf/authorizers.xml"
-          xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='Manager DN']" -v ${LDAP_MANAGER_DN} "${NIFI_HOME}/conf/authorizers.xml"
+          xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='Manager DN']" -v "${LDAP_MANAGER_DN}" "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='Manager Password']" -v ${LDAP_MANAGER_PASSWORD} "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='Initial User Identity admin']" -v ${INITIAL_ADMIN_IDENTITY} "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//authorizers/accessPolicyProvider/property[@name='Initial Admin Identity']" -v ${INITIAL_ADMIN_IDENTITY} "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='TLS - Keystore Password']" -v ${NIFI_TLS_KEYSTORE_PASSWORD} "${NIFI_HOME}/conf/login-identity-providers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='TLS - Truststore Password']" -v ${NIFI_TLS_TRUSTSTORE_PASSWORD} "${NIFI_HOME}/conf/login-identity-providers.xml"
-          xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager DN']" -v ${LDAP_MANAGER_DN} "${NIFI_HOME}/conf/login-identity-providers.xml"
+          xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager DN']" -v "${LDAP_MANAGER_DN}" "${NIFI_HOME}/conf/login-identity-providers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager Password']" -v ${LDAP_MANAGER_PASSWORD} "${NIFI_HOME}/conf/login-identity-providers.xml"
           prop_replace nifi.sensitive.props.key ${NIFI_SENSITIVE_PROPS_KEY}
           prop_replace nifi.security.keystorePasswd ${NIFI_TLS_KEYSTORE_PASSWORD}
