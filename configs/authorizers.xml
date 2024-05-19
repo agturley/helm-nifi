@@ -221,7 +221,7 @@
     <accessPolicyProvider>
         <identifier>file-access-policy-provider</identifier>
         <class>org.apache.nifi.authorization.FileAccessPolicyProvider</class>
-{{- if semverCompare "< 2.0.0" (semver .Values.image.tag) }}
+{{- if semverCompare "<= 2.0.0-0" .Values.image.tag }}
         <property name="User Group Provider">file-user-group-provider</property>
 {{- end}}
         <property name="Authorizations File">./auth-conf/authorizations.xml</property>
@@ -229,7 +229,7 @@
         <property name="Initial Admin Identity">{{.Values.auth.ldap.admin}}</property>
         {{- else }}
         <property name="Initial Admin Identity">{{ .Values.auth.admin }}</property>
-{{- if semverCompare ">= 2.0.0" (semver .Values.image.tag) }}
+{{- if semverCompare "> 2.0.0-0" .Values.image.tag }}
         {{- end}}
         {{- if and .Values.auth.ldap.enabled }}
         <property name="User Group Provider">composite-configurable-user-group-provider</property>
@@ -276,14 +276,14 @@
             NOTE: Any identity mapping rules specified in nifi.properties will also be applied to the node identities,
             so the values should be the unmapped identities (i.e. full DN from a certificate).
     -->
-{{- if semverCompare "< 2.0.0" (semver .Values.image.tag) }}
+{{- if semverCompare "< 2.0.0-0" .Values.image.tag }}
     {{- if .Values.auth.ldap.enabled}}
     <authorizer>
         <identifier>file-provider</identifier>
         <class>org.apache.nifi.authorization.FileAuthorizer</class>
         <property name="Authorizations File">./auth-conf/authorizations.xml</property>
         <property name="Users File">./auth-conf/users.xml</property>
-        <property name="Initial Admin Identity">{{.Values.auth.ldap.admin}}</property>
+        <property name="Initial Admin Identity">{{ .Values.auth.admin }}</property>
         <property name="Legacy Authorized Users File"></property>
 
     </authorizer>

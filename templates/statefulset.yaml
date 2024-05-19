@@ -156,6 +156,9 @@ spec:
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='TLS - Truststore Password']" -v ${NIFI_TLS_TRUSTSTORE_PASSWORD} "${NIFI_HOME}/conf/login-identity-providers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager DN']" -v "${LDAP_MANAGER_DN}" "${NIFI_HOME}/conf/login-identity-providers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager Password']" -v ${LDAP_MANAGER_PASSWORD} "${NIFI_HOME}/conf/login-identity-providers.xml"
+          {{- if semverCompare "< 2.0.0-0" .Values.image.tag }}
+          xmlstarlet ed --inplace --update "//authorizers/authorizer/property[@name='Initial Admin Identity']" -v "${INITIAL_ADMIN_IDENTITY}" "${NIFI_HOME}/conf/authorizers.xml"
+          {{- end }}
           prop_replace nifi.sensitive.props.key ${NIFI_SENSITIVE_PROPS_KEY}
           prop_replace nifi.security.keystorePasswd ${NIFI_TLS_KEYSTORE_PASSWORD}
           prop_replace nifi.security.keyPasswd ${NIFI_TLS_KEYSTORE_PASSWORD}
