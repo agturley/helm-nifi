@@ -33,7 +33,11 @@ KCURL=http://keycloak.default.svc.cluster.local:8080/auth
 
 KCAT=$($CURL \
             -d username=admin \
+<<<<<<< HEAD
             -d password=admin \
+=======
+            -d password=XXXX-XXXX_secret \
+>>>>>>> nifi-helm/main
             -d client_id=admin-cli \
             -d grant_type=password \
             $KCURL/realms/master/protocol/openid-connect/token | \
@@ -83,5 +87,10 @@ $CURL \
                    "enabled":"true", 
                    "redirectUris": [ "https://nifi.default.svc.cluster.local:8443/*", "https://ingress-nginx-controller.ingress-nginx.svc.cluster.local:443/*" ],
                    "publicClient": "false",
+<<<<<<< HEAD
                    "secret":"CZhA1IOePlXHz3PWqVwYoVAcYIUHTcDK"
                  }'
+=======
+                   "secret":"CZhA1IOePlXHz3PWqVwYoVAcYIUHTcDK_secret"
+                 }'
+>>>>>>> nifi-helm/main

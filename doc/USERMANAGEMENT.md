@@ -11,7 +11,11 @@ The Single User authentication is the default authentication in this helm chart.
 ```
 singleUser:
     username: username
+<<<<<<< HEAD
     password: changemechangeme
+=======
+    password: changemechangeme_secret
+>>>>>>> nifi-helm/main
 ```
 
 ## 2. Client Certificate

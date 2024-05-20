@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {{- if .Values.persistence.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -12,4 +13,20 @@ spec:
   resources:
     requests:
       storage: {{ .Values.persistence.caStorage.size }}
+=======
+{{- if .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nifi-ca
+spec:
+  accessModes:
+  {{- range .Values.persistence.accessModes }}
+    - {{ . | quote }}
+  {{- end }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.caStorage.size }}
+>>>>>>> nifi-helm/main
 {{- end }}
