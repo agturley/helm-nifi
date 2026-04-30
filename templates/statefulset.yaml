@@ -1,0 +1,246 @@
+{{/*
+Container named-template definitions are split into individual files
+under templates/statefulset-containers/ for maintainability:
+
+  _container_server.tpl            → nifi.container.server
+  _container_s3sync.tpl            → nifi.container.s3sync
+  _container_vaultsidecar.tpl   → nifi.container.vaultSidecar
+  _container_awssecretssidecar.tpl → nifi.container.awsSecretsSidecar
+  _container_logtailers.tpl        → nifi.container.logTailers
+  _container_certmanager.tpl       → nifi.container.certManager
+
+Helm loads all .tpl files in templates/ and subdirectories, so all named
+templates are globally available with no special wiring required.
+*/}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ template "apache-nifi.fullname" . }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    role: "nifi-app"
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+spec:
+  podManagementPolicy: {{ .Values.sts.podManagementPolicy }}
+  serviceName: {{ template "apache-nifi.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ template "apache-nifi.name" . }}
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+{{- if .Values.sts.pod.annotations }}
+{{ toYaml .Values.sts.pod.annotations | indent 8 }}
+{{- end }}
+      labels:
+        {{- include "nifi.commonLabels" . | nindent 8 }}
+        role: "nifi-app"
+        app: {{ include "apache-nifi.name" . | quote }}
+        chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+        release: {{ .Release.Name | quote }}
+        heritage: {{ .Release.Service | quote }}
+{{- if .Values.extraLabels }}
+{{ toYaml .Values.extraLabels | indent 8 }}
+{{- end }}
+    spec:
+{{- if .Values.schedulerName }}
+      schedulerName: {{ .Values.schedulerName }}
+{{- end }}
+
+{{- if .Values.sts.useHostNetwork }}
+      hostNetwork: {{ .Values.sts.useHostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+{{- end }}
+{{- if .Values.sts.hostAliases }}
+      hostAliases:
+{{ toYaml .Values.sts.hostAliases | indent 8 }}
+{{- end }}
+      serviceAccountName: {{ include "apache-nifi.serviceAccountName" . }}
+      {{- if eq .Values.sts.AntiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: "app"
+                    operator: In
+                    values:
+                    - {{ include "apache-nifi.name" . | quote }}
+              topologyKey: "kubernetes.io/hostname"
+      {{- else if eq .Values.sts.AntiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+             - weight: 1
+               podAffinityTerm:
+                 labelSelector:
+                    matchExpressions:
+                      - key: "app"
+                        operator: In
+                        values:
+                         - {{ include "apache-nifi.name" . | quote }}
+                 topologyKey: "kubernetes.io/hostname"
+      {{- end }}
+{{- if and .Values.affinity (and (ne .Values.sts.AntiAffinity "hard") (ne .Values.sts.AntiAffinity "soft")) }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+{{- end }}
+{{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+{{- end }}
+{{- if .Values.tolerations }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 8 }}
+{{- end }}
+{{- if .Values.nodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 8 }}
+{{- end }}
+      securityContext:
+{{- if .Values.securityContext }}
+{{ toYaml .Values.securityContext | indent 8 }}
+{{- else }}
+        sysctls:
+          - name: net.ipv4.ip_local_port_range
+            value: "10000 65000"
+{{- end }}
+      initContainers:
+{{- if .Values.properties.isNode }}
+      - name: zookeeper
+        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
+        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        resources:
+{{- toYaml .Values.zookeeperResources | nindent 10 }}
+        command:
+        - sh
+        - -c
+        - |
+          echo trying to contact {{ template "zookeeper.server" . }} {{ .Values.zookeeper.port }}
+          until nc -vzw 1 {{ template "zookeeper.server" . }} {{ .Values.zookeeper.port }}; do
+            echo "waiting for zookeeper..."
+            sleep 2
+          done
+{{- end }}
+{{- if .Values.NiFiSync.UserPolicySync.enabled }} 
+      - name: nifi-policysync
+        imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        command: ["python3", "/opt/nifi/nifi-sync/scripts/nifi-policysync.py"]
+        resources:
+{{ toYaml .Values.syncresources | indent 10 }}        
+        volumeMounts:
+          - mountPath: /opt/nifi/nifi-sync/scripts
+            name: nifisync-scripts
+          - mountPath: /opt/nifi/data
+            {{- if and .Values.persistence.enabled .Values.persistence.subPath.enabled (not .Values.persistence.dataStorage.DisallowSubPath) }}
+            name: {{ .Values.persistence.subPath.name }}
+            subPath: data
+            {{- else }}
+            name: "data"
+            {{- end }}
+          - mountPath: /opt/nifi/nifi-current/auth-conf/
+            {{- if and .Values.persistence.enabled .Values.persistence.subPath.enabled (not .Values.persistence.authconfStorage.DisallowSubPath) }}
+            name: {{ .Values.persistence.subPath.name }}
+            subPath: auth-conf
+            {{- else }}
+            name: "auth-conf"
+            {{- end }}
+        
+{{- end }}
+{{- $vals := .Values.VaultNiFiSecrets }}
+
+{{- if .Values.persistence.enabled }}
+      - name: create-custom-dir
+        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
+        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        resources:
+{{ toYaml .Values.logresources | indent 10 }}
+        command:
+        - sh
+        - -c
+        - |
+          mkdir -p /opt/nifi/data/custom
+        volumeMounts:
+          - mountPath: /opt/nifi/data
+            {{- if and .Values.persistence.enabled .Values.persistence.subPath.enabled (not .Values.persistence.dataStorage.DisallowSubPath) }}
+            name: {{ .Values.persistence.subPath.name }}
+            subPath: data
+            {{- else }}
+            name: "data"
+            {{- end }}
+{{- end }}
+
+{{- range $key, $value := .Values.initContainers }}
+      - name: {{ $key }}
+{{ toYaml $value | indent 8 }}
+{{- end }}
+      {{- $pullSecrets := list -}}
+      {{- if .Values.image.pullSecret }}{{- $pullSecrets = append $pullSecrets .Values.image.pullSecret }}{{- end }}
+      {{- if and .Values.awsSecretsSync.enabled .Values.awsSecretsSync.image.pullSecret }}{{- $pullSecrets = append $pullSecrets .Values.awsSecretsSync.image.pullSecret }}{{- end }}
+      {{- if $pullSecrets }}
+      imagePullSecrets:
+        {{- range $pullSecrets }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      containers:
+{{- if .Values.extraContainers }}
+{{- range .Values.extraContainers }}
+      - name: {{ .name }}
+        image: {{ .image }}
+        {{- if .command }}
+        command:
+          {{- toYaml .command | nindent 10 }}
+        {{- end }}
+        {{- if .args }}
+        args:
+          {{- toYaml .args | nindent 10 }}
+        {{- end }}
+        {{- if .ports }}
+        ports:
+          {{- toYaml .ports | nindent 10 }}
+        {{- end }}
+        {{- if .env }}
+        env:
+          {{- toYaml .env | nindent 10 }}
+        {{- end }}
+        {{- if .envFrom }}
+        envFrom:
+          {{- toYaml .envFrom | nindent 10 }}
+        {{- end }}
+        {{- if .volumeMounts }}
+        volumeMounts:
+          {{- toYaml .volumeMounts | nindent 10 }}
+        {{- end }}
+        {{- if .securityContext }}
+        securityContext:
+          {{- toYaml .securityContext | nindent 10 }}
+        {{- end }}
+        resources:
+          {{- $defaults := $.Values.extraContainerResources | default (dict) -}}
+          {{- $overrides := .resources | default (dict) -}}
+          {{- merge $overrides $defaults | toYaml | nindent 10 }}
+{{- end }}
+{{- end }}
+{{ include "nifi.container.server" . }}
+{{- if .Values.NiFiSync.s3Sync.enabled }}
+{{ include "nifi.container.s3sync" . }}
+{{- end }}
+{{- $vals := .Values.VaultNiFiSecrets }}
+{{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
+{{ include "nifi.container.vaultSidecar" . }}
+{{- end }}
+{{- if .Values.awsSecretsSync.enabled }}
+{{ include "nifi.container.awsSecretsSidecar" . }}
+{{- end }}
+{{ include "nifi.container.logTailers" . }}
+{{- if .Values.certManager.enabled }}
+{{ include "nifi.container.certManager" . }}
+{{- end }}
+{{ include "nifi.statefulset.volumes" . }}

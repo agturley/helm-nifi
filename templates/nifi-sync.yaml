@@ -1,0 +1,1161 @@
+{{if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled}}
+# Create Sync Scripts
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nifisync-scripts
+  namespace: {{ .Values.namespace }}
+data:
+{{ if .Values.NiFiSync.UserPolicySync.enabled }}
+  nifi-policysync.py: |
+    #!/usr/bin/env python3
+    """
+    Sync NiFi users.xml and authorizations.xml with optional managed and external LDAP groups.
+    
+    Features:
+      1. ENABLE_MANAGED_GROUPS: skip or include built-in managed groups
+      2. Custom monitoring user with read-only access (env MONITORING_USER)
+      3. Node users generated per REPLICA_COUNT
+      4. External LDAP groups granted roles via the `external_group_roles` mapping without creating entries in users.xml
+
+    Tracks dropped external groups in `external_groups.json` and removes their policies.
+    """
+    import gzip
+    import json
+    import os
+    import uuid
+    import hashlib
+    import shutil
+    import xml.etree.ElementTree as ET
+    from pathlib import Path
+    from xml.dom import minidom
+    from datetime import datetime
+    import logging
+
+    # Configure basic logging at DEBUG to capture LDAP-group steps
+    logging.basicConfig(format='[%(levelname)s] %(message)s', level=logging.DEBUG)
+
+    # Default paths
+    NIFI_HOME = Path(os.getenv("NIFI_HOME", "/opt/nifi/nifi-current"))
+    CONF_DIR = Path(os.getenv("CONF_DIR", "/opt/nifi/data"))
+    BACKUP_DIR = NIFI_HOME / "auth-conf" / "backup"
+    USERS_XML_PATH = NIFI_HOME / "auth-conf/users.xml"
+    AUTH_XML_PATH = NIFI_HOME / "auth-conf/authorizations.xml"
+    FLOW_JSON_GZ_PATH = CONF_DIR / "flow.json.gz"
+    ROOT_PGID_CACHE = NIFI_HOME / "auth-conf/rootpgid"
+    GROUP_TRACK_FILE = NIFI_HOME / "auth-conf" / "nifi-sync_external_groups.json"
+    USER_TRACK_FILE  = NIFI_HOME / "auth-conf" / "nifi-sync_managed_users.json"
+
+    # Track per-file changes
+    changed_users = False
+    changed_auth  = False
+
+    # Environment-configurable flags
+    ENABLE_MANAGED_GROUPS = os.getenv("ENABLE_MANAGED_GROUPS", "true").lower() in ("1", "true", "yes")
+    MONITORING_USER = 'CN={{ template "apache-nifi.fullname" $ }}-monitor, OU=NIFI'
+    REPLICA_COUNT = {{ .Values.replicaCount }}
+    NODE_USER_TEMPLATE = 'CN={{ template "apache-nifi.fullname" $ }}-{i}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}, OU=NIFI'
+
+    # Namespace for deterministic UUID5
+    default_namespace = uuid.uuid5(uuid.NAMESPACE_DNS, "nifi-sync")
+
+    # Managed LDAP groups and default group->role mapping from Helm values
+    {{- $mgr := .Values.NiFiSync.UserPolicySync.managedGroupRoles }}
+    managed_groups = {
+    {{- range $grp, $role := $mgr }}
+        "{{ $grp }}": [],
+    {{- end }}
+    }
+    managed_group_roles = {
+    {{- range $grp, $role := $mgr }}
+        "{{ $grp }}": "{{ $role }}",
+    {{- end }}
+    }
+
+    # Managed internal NiFi users from Helm values
+    managed_users = [
+    {{- range $user := .Values.NiFiSync.UserPolicySync.managedUsers }}
+        "{{ $user }}",
+    {{- end }}
+    ]
+
+    # Ensure managed internal NiFi users exist and track them
+    def apply_managed_users(root, ids_map, tracker_set):
+        for usr in managed_users:
+            uid = ensure_user(root, usr, ids_map)
+            tracker_set.add(usr)
+
+    # Mapping of managed users to groups from Helm values
+    managed_user_groups = {
+    {{- range $user, $groups := .Values.NiFiSync.UserPolicySync.managedUserGroups }}
+        "{{ $user }}": [
+        {{- range $idx, $grp := $groups }}"{{ $grp }}"{{ if not (eq (add $idx 1) (len $groups)) }}, {{ end }}
+        {{- end }}],
+    {{- end }}
+    }
+
+    # Role privileges mapping
+    role_privileges = {
+        "monitoring": [
+            # existing system-wide
+            ("R", "/flow"),
+            # read on root PG and its children
+            ("R", "/process-groups/ROOT_PG"),
+            ("R", "/data/process-groups/ROOT_PG"),
+        ],
+        "ro": [
+          # existing system-wide privileges
+          ("R", "/flow"),
+          ("R", "/tenants"),
+          ("R", "/policies"),
+          ("R", "/controller"),
+          ("R", "/provenance"),
+          ("R", "/site-to-site"), ("R", "/system"),
+          ("R", "/counters"),
+          # read on root PG and its children
+          ("R", "/process-groups/ROOT_PG"),
+          ("R", "/provenance-data/process-groups/ROOT_PG"),
+          ("R", "/data/process-groups/ROOT_PG"),
+        ],
+        "rw": [
+            # existing system-wide privileges
+            ("R", "/flow"), ("W", "/restricted-components"),
+            ("R", "/tenants"),
+            ("R", "/policies"),
+            ("R", "/controller"), ("W", "/controller"), 
+            ("R", "/provenance"), ("W", "/provenance"), 
+            ("R", "/site-to-site"), ("R", "/system"), 
+            ("R", "/counters"), ("W", "/counters"),
+            # read/write on root PG and its children
+            ("R", "/process-groups/ROOT_PG"), ("W", "/process-groups/ROOT_PG"),
+            ("W", "/operation/process-groups/ROOT_PG"), ("R", "/provenance-data/process-groups/ROOT_PG"),
+            ("R", "/data/process-groups/ROOT_PG"), ("W", "/data/process-groups/ROOT_PG"),
+        ],
+        "admin": [
+          # existing system-wide privileges
+          ("R", "/flow"), ("W", "/restricted-components"),
+          ("R", "/tenants"), ("W", "/tenants"),
+          ("R", "/policies"), ("W", "/policies"), 
+          ("R", "/controller"), ("W", "/controller"), 
+          ("R", "/provenance"), ("W", "/provenance"), 
+          ("R", "/site-to-site"), ("R", "/system"), 
+          ("R", "/counters"), ("W", "/counters"),
+          # read/write on root PG and its children
+          ("R", "/process-groups/ROOT_PG"), ("W", "/process-groups/ROOT_PG"),
+          ("W", "/operation/process-groups/ROOT_PG"), ("R", "/provenance-data/process-groups/ROOT_PG"),
+          ("R", "/data/process-groups/ROOT_PG"), ("W", "/data/process-groups/ROOT_PG"),
+        ]
+    }
+    # External LDAP group->role mapping (customize here)
+    external_group_roles = {
+      {{- range $grp, $role := .Values.NiFiSync.UserPolicySync.externalGroupRoles }}
+          "{{ $grp }}": "{{ $role }}",
+      {{- end }}
+    }
+
+    # Helper functions at module scope
+    def generate_group_uuid(name: str) -> str:
+        digest = hashlib.md5(name.encode('utf-8')).digest()
+        b = bytearray(digest)
+        b[6] = (b[6] & 0x0F) | (3 << 4)
+        b[8] = (b[8] & 0x3F) | 0x80
+        return str(uuid.UUID(bytes=bytes(b)))
+
+    def generate_id(kind: str, name: str, namespace: uuid.UUID = default_namespace) -> str:
+        return str(uuid.uuid5(namespace, f"{kind}:{name}"))
+
+    def prettify(elem: ET.Element) -> str:
+        rough = ET.tostring(elem, 'utf-8')
+        reparsed = minidom.parseString(rough)
+        pretty = reparsed.toprettyxml(indent="  ")
+        return "\n".join([line for line in pretty.splitlines() if line.strip()])
+
+    def get_root_pg_id() -> str | None:
+        if ROOT_PGID_CACHE.exists():
+            pgid = ROOT_PGID_CACHE.read_text().strip()
+            if pgid:
+                return pgid
+        if not FLOW_JSON_GZ_PATH.exists():
+            logging.warning("flow.json.gz not found – cannot resolve root process group ID")
+            return None
+        with gzip.open(FLOW_JSON_GZ_PATH, "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+            pgid = data.get("rootGroup", {}).get("instanceIdentifier")
+            if pgid:
+                ROOT_PGID_CACHE.write_text(pgid)
+            return pgid
+
+    def load_users_xml():
+        if USERS_XML_PATH.exists():
+            tree = ET.parse(USERS_XML_PATH)
+            root = tree.getroot()
+        else:
+            root = ET.Element("tenants")
+            ET.SubElement(root, "users")
+            ET.SubElement(root, "groups")
+            tree = ET.ElementTree(root)
+        return tree, root
+
+    def current_id_maps(root: ET.Element) -> tuple[dict[str,str], dict[str,str]]:
+        user_ids, group_ids = {}, {}
+        for user in root.findall(".//user"):
+            ident = user.attrib.get("identity")
+            if ident:
+                user_ids[ident] = user.attrib["identifier"]
+        for group in root.findall(".//group"):
+            name = group.attrib.get("name")
+            if name:
+                group_ids[name] = group.attrib["identifier"]
+        return user_ids, group_ids
+
+    def ensure_user(root: ET.Element, identity: str, user_ids: dict[str,str]) -> str:
+        global changed_users
+        if identity in user_ids:
+            return user_ids[identity]
+        users_elem = root.find("users") or ET.SubElement(root, "users")
+        uid = generate_id("user", identity)
+        ET.SubElement(users_elem, "user", {"identifier": uid, "identity": identity})
+        user_ids[identity] = uid
+        changed_users = True
+        logging.info(f"Created user '{identity}' ({uid})")
+        return uid
+
+    def ensure_group(root: ET.Element, name: str, group_ids: dict[str,str]) -> str:
+        global changed_users
+        if name in group_ids:
+            return group_ids[name]
+        groups_elem = root.find("groups") or ET.SubElement(root, "groups")
+        gid = generate_id("group", name)
+        ET.SubElement(groups_elem, "group", {"identifier": gid, "name": name})
+        group_ids[name] = gid
+        changed_users = True
+        logging.info(f"Created group '{name}' ({gid})")
+        return gid
+
+    def add_policy(policies_elem: ET.Element, action: str, resource: str,
+                   user_ids_to_add: list[str], group_ids_to_add: list[str],
+                   user_names_to_add: list[str] = None, group_names_to_add: list[str] = None) -> None:
+        global changed_auth
+        user_names_to_add = user_names_to_add or []
+        group_names_to_add = group_names_to_add or []
+        policy = next((p for p in policies_elem.findall("policy") if p.attrib.get("action") == action and p.attrib.get("resource") == resource), None)
+        if not policy:
+            policy = ET.SubElement(policies_elem, "policy", {"identifier": generate_id("policy", f"{action}:{resource}"), "action": action, "resource": resource})
+            changed_auth = True
+        existing_gids = {g.attrib["identifier"] for g in policy.findall("group")}
+        existing_uids = {u.attrib["identifier"] for u in policy.findall("user")}
+        new_gids = set(group_ids_to_add) - existing_gids
+        new_uids = set(user_ids_to_add) - existing_uids
+
+        if new_gids or new_uids:
+            changed_auth = True
+            for name, gid in zip(group_names_to_add, group_ids_to_add):
+                if gid in new_gids:
+                    logging.info(f"Adding group '{name}' ({gid}) to policy {action}:{resource}")
+            for name, uid in zip(user_names_to_add, user_ids_to_add):
+                if uid in new_uids:
+                    logging.info(f"Adding user '{name}' ({uid}) to policy {action}:{resource}")
+            merged_gid_list = sorted(existing_gids.union(group_ids_to_add))
+            merged_uid_list = sorted(existing_uids.union(user_ids_to_add))
+            for child in list(policy):
+                policy.remove(child)
+            for gid in merged_gid_list:
+                ET.SubElement(policy, "group", {"identifier": gid})
+            for uid in merged_uid_list:
+                ET.SubElement(policy, "user", {"identifier": uid})
+
+    def load_tracked_groups() -> set[str]:
+        if GROUP_TRACK_FILE.exists():
+            try:
+                return set(json.loads(GROUP_TRACK_FILE.read_text()))
+            except Exception:
+                logging.warning(f"Could not parse {GROUP_TRACK_FILE}; resetting")
+        return set()
+
+    def load_tracked_users() -> set[str]:
+        if USER_TRACK_FILE.exists():
+            try:
+                return set(json.loads(USER_TRACK_FILE.read_text()))
+            except Exception:
+                logging.warning(f"Could not parse {USER_TRACK_FILE}; resetting")
+        return set()
+
+    def save_track(path: Path, items: set[str]) -> None:
+        path.write_text(json.dumps(sorted(items), indent=2))
+
+    def main():
+        global changed_users, changed_auth
+        # initialize tracker set
+        current_users: set[str] = set()
+
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        users_tree, users_root = load_users_xml()
+        user_ids, group_ids = current_id_maps(users_root)
+        root_pg_id = get_root_pg_id()
+        # Ensure monitoring user exists and is tracked before purges
+        mon_uid = ensure_user(users_root, MONITORING_USER, user_ids)
+        current_users.add(MONITORING_USER)
+        
+        # Create & track internal managed NiFi users
+        apply_managed_users(users_root, user_ids, current_users)
+
+        # Assign mapped managed users into their Helm-defined groups
+        for usr, grps in managed_user_groups.items():
+            uid = user_ids.get(usr)
+            if uid:
+                for grp in grps:
+                    gid = ensure_group(users_root, grp, group_ids)
+                    grp_elem = users_root.find(f".//group[@name='{grp}']")
+                    if grp_elem is not None and not grp_elem.find(f"./user[@identifier='{uid}']"):
+                        ET.SubElement(grp_elem, "user", {"identifier": uid})
+                        current_users.add(usr)
+        if not root_pg_id:
+            logging.error("Cannot resolve root process group ID. Exiting.")
+            return
+
+        # Ensure the monitoring user exists and is tracked before purges
+        mon_uid = ensure_user(users_root, MONITORING_USER, user_ids)
+        current_users.add(MONITORING_USER)
+
+        # Managed groups in users.xml
+        if ENABLE_MANAGED_GROUPS:
+            for grp, members in managed_groups.items():
+                gid = ensure_group(users_root, grp, group_ids)
+                for m in members:
+                    uid = ensure_user(users_root, m, user_ids)
+                    current_users.add(m)
+                    grp_elem = users_root.find(f".//group[@name='{grp}']")
+                    if grp_elem is not None and not grp_elem.find(f"./user[@identifier='{uid}']"):
+                        ET.SubElement(grp_elem, "user", {"identifier": uid})
+
+        # Node users
+        node_uids = [ensure_user(users_root, NODE_USER_TEMPLATE.format(i=i), user_ids) for i in range(REPLICA_COUNT)]
+        for idx, uid in enumerate(node_uids):
+            uname = NODE_USER_TEMPLATE.format(i=idx)
+            current_users.add(uname)
+
+        # Load or initialize authorizations.xml
+        if AUTH_XML_PATH.exists():
+            auth_tree = ET.parse(AUTH_XML_PATH)
+            auth_root = auth_tree.getroot()
+        else:
+            auth_root = ET.Element("authorizations")
+            auth_tree = ET.ElementTree(auth_root)
+        policies_elem = auth_root.find("policies") or ET.SubElement(auth_root, "policies")
+
+        # Assign per-node-user permissions
+        node_permissions = [
+            ("R", "/data/process-groups/ROOT_PG"),
+            ("W", "/data/process-groups/ROOT_PG"),
+            ("R", "/site-to-site"),
+            ("R", "/controller"),
+            ("R", "/system"),
+            ("W", "/proxy"),
+        ]
+        for idx, uid in enumerate(node_uids):
+            uname = NODE_USER_TEMPLATE.format(i=idx)
+            for action, resource in node_permissions:
+                add_policy(
+                    policies_elem,
+                    action,
+                    resource.replace("ROOT_PG", root_pg_id),
+                    [uid],
+                    [],
+                    [uname],
+                    []
+                )
+
+        # Apply managed group policies
+        if ENABLE_MANAGED_GROUPS:
+            for grp, role in managed_group_roles.items():
+                gid = ensure_group(users_root, grp, group_ids)
+                for action, resource in role_privileges.get(role, []):
+                    add_policy(
+                        policies_elem,
+                        action,
+                        resource.replace("ROOT_PG", root_pg_id),
+                        [user_ids[m] for m in managed_groups.get(grp, []) if m in user_ids],
+                        [gid],
+                        [m for m in managed_groups.get(grp, []) if m in user_ids],
+                        [grp]
+                    )
+
+        # Apply external LDAP group policies
+        for grp, role in external_group_roles.items():
+            logging.info(f"Processing LDAP group '{grp}' with role '{role}'")
+            gid = generate_group_uuid(grp)
+            for action, resource in role_privileges.get(role, []):
+                add_policy(
+                    policies_elem,
+                    action,
+                    resource.replace("ROOT_PG", root_pg_id),
+                    [],
+                    [gid],
+                    [],
+                    [grp]
+                )
+
+        # Purge removed managed users
+        old_users = load_tracked_users()
+        removed_users = old_users - current_users
+        if removed_users:
+            logging.info(f"Detected removed managed users: {removed_users}")
+            for usr in removed_users:
+                uid = generate_id("user", usr)
+                for policy in list(policies_elem.findall("policy")):
+                    for uel in policy.findall("user"):
+                        if uel.attrib.get("identifier") == uid:
+                            logging.info(f"Removing user '{usr}' ({uid}) from policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                            policy.remove(uel)
+                            changed_auth = True
+                    if not policy.findall("group") and not policy.findall("user"):
+                        logging.info(f"Removing empty policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                        policies_elem.remove(policy)
+                        changed_auth = True
+
+        # Purge removed external groups
+        old_groups = load_tracked_groups()
+        removed_groups = old_groups - set(external_group_roles.keys())
+        if removed_groups:
+            logging.info(f"Detected removed LDAP groups: {removed_groups}")
+            for grp in removed_groups:
+                gid = generate_group_uuid(grp)
+                for policy in list(policies_elem.findall("policy")):
+                    for g in policy.findall("group"):
+                        if g.attrib.get("identifier") == gid:
+                            logging.info(f"Removing group '{grp}' ({gid}) from policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                            policy.remove(g)
+                            changed_auth = True
+                    if not policy.findall("group") and not policy.findall("user"):
+                        logging.info(f"Removing empty policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                        policies_elem.remove(policy)
+                        changed_auth = True
+        # ——— Also remove the user entry itself from users.xml ———
+        users_elem  = users_root.find("users")
+        groups_elem = users_root.find("groups")
+
+        for usr in removed_users:
+            uid = generate_id("user", usr)
+            # 1) Remove the <user> element
+            user_el = users_elem.find(f"./user[@identifier='{uid}']")
+            if user_el is not None:
+                users_elem.remove(user_el)
+                changed_users = True
+                logging.info(f"Removed user '{usr}' ({uid}) from users.xml")
+
+            # 2) Remove them from any <group> memberships
+            for grp_el in groups_elem.findall("group"):
+                member_el = grp_el.find(f"./user[@identifier='{uid}']")
+                if member_el is not None:
+                    grp_el.remove(member_el)
+                    changed_users = True
+                    logging.info(
+                        f"Removed user '{usr}' ({uid}) from group '{grp_el.attrib['name']}'"
+                    )
+        # Monitoring user
+        mon_uid = ensure_user(users_root, MONITORING_USER, user_ids)
+        current_users.add(MONITORING_USER)
+        {{- if .Values.metrics.prometheus.enabled }}
+        for action, resource in role_privileges["monitoring"]:
+            add_policy(
+                policies_elem,
+                action,
+                resource.replace("ROOT_PG", root_pg_id),
+                [mon_uid],
+                [],
+                [MONITORING_USER],
+                []
+            )
+        {{- end }}
+
+        # Backup & write
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        if changed_users:
+            dst = BACKUP_DIR / f"{USERS_XML_PATH.name}.{ts}.bak"
+            shutil.copy2(USERS_XML_PATH, dst)
+            logging.debug(f"Backed up users.xml → {dst}")
+            USERS_XML_PATH.write_text(prettify(users_root))
+            logging.info("users.xml updated")
+        if changed_auth:
+            dst = BACKUP_DIR / f"{AUTH_XML_PATH.name}.{ts}.bak"
+            shutil.copy2(AUTH_XML_PATH, dst)
+            logging.debug(f"Backed up authorizations.xml → {dst}")
+            AUTH_XML_PATH.write_text(prettify(auth_root))
+            logging.info("authorizations.xml updated")
+        if not changed_users and not changed_auth:
+            logging.info("No changes detected; nothing to write or backup")
+
+        # Persist trackers
+        save_track(USER_TRACK_FILE, current_users)
+        save_track(GROUP_TRACK_FILE, set(external_group_roles.keys()))
+
+    if __name__ == "__main__":
+        main()
+{{/* end UserPolicySync.enabled */}}{{ end }}
+
+
+
+  create-secrets-vault.sh: |
+    #!/bin/bash
+    echo "$(date) - INFO - -------------------------- Starting Generic secret sync --------------------------"
+
+    # Variables (populated via Helm)
+    NAMESPACE="{{ $.Release.Namespace }}"
+    KUBERNETES_API_SERVER="https://kubernetes.default.svc"
+    VAULT_ENABLED="{{ .Values.NiFiSync.vault.enabled }}"  # Flag to determine whether to use Vault
+    VAULT_ADDR="{{ .Values.NiFiSync.vault.address }}"     # Vault address
+    VAULT_ROLE="{{ .Values.NiFiSync.vault.role }}"         # Vault role used for Kubernetes authentication
+    VAULT_NAMESPACE="{{ .Values.NiFiSync.vault.namespace }}"  # Vault namespace used to store secrets
+    VAULT_MOUNT="{{ .Values.NiFiSync.vault.mount }}"          # Vault mount path
+    VAULT_PATH="{{ .Values.NiFiSync.vault.path }}"            # Vault path used to store secrets
+    LOCAL_DATA_DIR="/tmp/secrets-data"  # Directory to store local secret data for comparison
+    FOUND_SECRETS=()  # Array to keep track of found secret names
+    ADDED_SECRETS=()  # Array to keep track of added/updated secret names
+
+    # Paths for service account credentials
+    SA_TOKEN_PATH="/run/secrets/kubernetes.io/secret-modifier-token/token"
+    VAULT_SA_TOKEN_PATH="/run/secrets/kubernetes.io/default-token/token"
+    KUBE_CA_PATH="/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+
+
+    # Function to base64 encode files
+    encode_file() {
+      local file="$1"
+      base64 -w 0 "$file"
+    }
+    
+    # Function to authenticate to Vault using Kubernetes service account token
+    authenticate_with_vault() {
+      echo "$(date) - INFO - Authenticating with Vault using Kubernetes service account..."
+
+      VAULT_TOKEN=$(curl -s --request POST \
+        --header "X-Vault-Namespace: $VAULT_NAMESPACE" \
+        --data "{\"jwt\": \"$(cat $VAULT_SA_TOKEN_PATH)\", \"role\": \"$VAULT_ROLE\"}" \
+        --cacert <(echo "$KUBE_CA_PATH") \
+        "$VAULT_ADDR/v1/auth/$VAULT_MOUNT/login" | jq -r '.auth.client_token')
+    
+      if [ "$VAULT_TOKEN" == "null" ] || [ -z "$VAULT_TOKEN" ]; then
+        echo "$(date) - ERROR - Vault authentication failed."
+        exit 1
+      else
+        echo "$(date) - INFO - Successfully authenticated with Vault."
+      fi
+    }
+    
+    
+    check_certs() {
+      local TOKEN="$(cat /run/secrets/kubernetes.io/secret-modifier-token/token)"  # Kubernetes API token from the Pod's service account
+      local secret_name="$1"
+      local data="$2"
+      local local_data_file="$3"
+      local secret_type="$4"
+      local sync_task=""
+
+      # If no local cache file, attempt to retrieve existing secret from K8s or Vault
+      if [ ! -f "$local_data_file" ]; then
+        echo "$(date) - INFO - No local data cache found for $secret_name. Checking Kubernetes for existing secret..." >&2
+      
+        # Try to pull the existing secret from Kubernetes
+        existing_secret=$(curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" -X GET \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Accept: application/json" \
+          "$KUBERNETES_API_SERVER/api/v1/namespaces/$NAMESPACE/secrets/$secret_name")
+          # Try to pull the existing secret from Vault
+          
+    
+        if [ "$existing_secret" == "200" ]; then
+          echo "$(date) - INFO - Existing secret found in Kubernetes for $secret_name. Saving to local file..." >&2
+         
+          #####VAULT READ
+          if [ "$secret_type" == "vault" ]; then
+            # If stored in Vault
+            echo "$(date) - INFO - Reading $secret_name from Vault and saving to local file..." >&2
+            cresponse=$(curl -s -X GET \
+              --header "X-Vault-Token: $VAULT_TOKEN" \
+              --cacert <(echo "$KUBE_CA_PATH") \
+              "$VAULT_ADDR/v1/$VAULT_NAMESPACE/$VAULT_MOUNT/data/$VAULT_PATH/$secret_name")
+            kubernetes_data=$(echo "$cresponse" | jq -c '.data')
+            kubernetes_data=$(echo $kubernetes_data | jq -c '.data')
+            # Force base64 so it matches the format you compare later
+            kubernetes_data=$(echo "$kubernetes_data" | jq '. |= with_entries(.value |= @base64)')
+            echo $kubernetes_data > $local_data_file
+
+          else
+            # If stored in Kubernetes
+            echo "$(date) - INFO - Reading $secret_name from Kubernetes and saving to local file..." >&2
+            cresponse=$(curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -X GET \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/json" \
+              "$KUBERNETES_API_SERVER/api/v1/namespaces/$NAMESPACE/secrets/$secret_name")
+            kubernetes_data=$(echo "$cresponse" | jq -c '.data')
+            echo $kubernetes_data > $local_data_file
+          fi
+        else
+          echo "$(date) - INFO - No existing secret found in Kubernetes for $secret_name. Creating a new one..." >&2
+          sync_task="new"
+        fi
+      else
+        # local data exists
+        echo "$(date) - INFO - Local data cache found for $secret_name." >&2
+        kubernetes_data=$(cat "$local_data_file")
+      fi
+      
+      # Compare the existing and new secret data
+
+      local_data=$(echo "$data" | jq -c '.data')
+      kubernetes_data=$(echo "$kubernetes_data" | jq -c)
+      #DEBUG SHOW BOTH THE CONTENTS
+      #echo =============k8s-data------------------ >&2
+      #echo kubernetes_data >&2
+      #echo $kubernetes_data >&2
+      #echo local_data >&2
+      #echo $local_data >&2
+      #echo =============k8s-data------------------ >&2
+      if [ "$kubernetes_data" == "$local_data" ]; then
+        echo "$(date) - INFO - The existing local data for $secret_name matches the new data. No update needed." >&2
+        sync_task="match"
+        printf "match"
+      else
+        if [ "$sync_task" == "new" ]; then
+          printf "new"
+        else
+          sync_task="update"
+          printf "update"
+        fi
+      fi >&1
+    }
+    
+    
+    # Function to write secrets to Vault
+
+    
+    write_to_vault() {
+      local secret_name="$1"
+      local secret_data="$2"
+      local local_data_file="$3"
+      local sync_type="$4"
+      local secret_pathtype="$5"
+    
+      if [ "$sync_type" == "new" ] || [ "$sync_type" == "update" ]; then
+        echo "$(date) - INFO - Writing secret: $secret_name to Vault..." >&2
+    
+        # Decode the base64 so Vault gets raw file contents
+        decoded_data=$(echo "$secret_data" | jq '.data |= with_entries(.value |= @base64d)')
+        echo $decoded_data
+    
+        # Pipe decoded_data to curl via stdin
+        http_status=$(
+          echo "$decoded_data" | \
+          curl -s -o /dev/null -w "%{http_code}" \
+          -X POST \
+          --header "X-Vault-Token: $VAULT_TOKEN" \
+          --cacert <(echo "$KUBE_CA_PATH") \
+          --data-binary @- \
+          "$VAULT_ADDR/v1/$VAULT_NAMESPACE/$VAULT_MOUNT/data/$VAULT_PATH/$secret_name"
+        )
+    
+        if [ "$http_status" -eq 200 ] || [ "$http_status" -eq 204 ]; then
+          echo "$(date) - INFO - Successfully wrote secret: $secret_name to Vault" >&2
+          create_vault_kubernetes_secrets "$secret_name" "$sync_type" "$local_data_file" "$secret_pathtype"
+        else
+          echo "$(date) - ERROR - Failed to write secret: $secret_name to Vault" >&2
+          echo $http_status
+        fi
+      fi
+
+    }
+    
+    # Function to write secrets to Kubernetes
+    create_vault_kubernetes_secrets() {
+      local TOKEN="$(cat /run/secrets/kubernetes.io/secret-modifier-token/token)"  # Kubernetes API token from the Pod's service account
+      local secret_name="$1"
+      local sync_type="$2"
+      local local_data_file="$3"
+      local secret_pathtype="$4"
+    
+      if [ "$sync_type" == "new" ]; then
+        echo "$(date) - INFO - Creating new VaultStaticSecret $secret_name in Kubernetes..."
+        VAULT_STATIC_SECRET='{
+          "apiVersion": "secrets.hashicorp.com/v1beta1",
+          "kind": "VaultStaticSecret",
+          "metadata": {
+            "name": "'"$secret_name"'",
+            "namespace": "'"$NAMESPACE"'"
+          },
+          "spec": {
+            "type": "kv-v2",
+            "mount": "'"$VAULT_MOUNT"'",
+            "path": "'"$VAULT_PATH/$secret_name"'",
+            "destination": {
+              "name": "'"$secret_name"'",
+              "create": true,
+              "type": "'"$secret_pathtype"'"
+            },
+            "refreshAfter": "30m",
+            "vaultAuthRef": "'"vaultauth-$VAULT_MOUNT"'"
+          }
+        }'
+        cresponse=$(curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$VAULT_STATIC_SECRET" \
+          "$KUBERNETES_API_SERVER/apis/secrets.hashicorp.com/v1beta1/namespaces/$NAMESPACE/vaultstaticsecrets")
+        if [ "$cresponse" == "201" ]; then
+          echo "$(date) - INFO - Successfully created new secret: $secret_name"
+        else
+          echo "$(date) - ERROR - Failed to create secret: $secret_name"
+          echo "$(date) - ERROR - Failure Response: $cresponse"
+        fi
+      elif [ "$sync_type" == "update" ]; then
+        echo "$(date) - INFO - Updating existing VaultStaticSecret $secret_name in Kubernetes..."
+        VAULT_STATIC_SECRET='{
+          "apiVersion": "secrets.hashicorp.com/v1beta1",
+          "kind": "VaultStaticSecret",
+          "metadata": {
+            "name": "'"$secret_name"'",
+            "namespace": "'"$NAMESPACE"'",
+            "annotations": {
+              "force-refresh": "'$(date +%s)'"
+            }
+          },
+          "spec": {
+            "type": "kv-v2",
+            "mount": "'"$VAULT_MOUNT"'",
+            "path": "'"$VAULT_PATH/$secret_name"'",
+            "destination": {
+              "name": "'"$secret_name"'",
+              "create": true,
+              "type": "'"$secret_pathtype"'"
+            },
+            "refreshAfter": "30m",
+            "vaultAuthRef": "'"vaultauth-$VAULT_MOUNT"'"
+          }
+        }'
+        cresponse=$(curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" -X PATCH \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/merge-patch+json" \
+          -d "$VAULT_STATIC_SECRET" \
+          "$KUBERNETES_API_SERVER/apis/secrets.hashicorp.com/v1beta1/namespaces/$NAMESPACE/vaultstaticsecrets/$secret_name")
+        if [ "$cresponse" == "200" ]; then
+          echo "$(date) - INFO - Successfully updated VaultStaticSecret: $secret_name"
+        else
+          echo "$(date) - ERROR - Failed to update VaultStaticSecret: $secret_name"
+        fi
+      fi
+    
+      # Add secret name to the added/updated secrets array
+      ADDED_SECRETS+=("$secret_name")
+      # Update the local data file with the new data
+      echo "$(date) - INFO - Updating local data cache for $secret_name"
+      cleaned_data=$(echo "$data" | jq -c '.data')
+      echo "$cleaned_data" > "$local_data_file" 
+    }
+    
+    # Function to write secrets directly to Kubernetes
+    write_to_kubernetes() {
+      local TOKEN="$(cat /run/secrets/kubernetes.io/secret-modifier-token/token)"  # Kubernetes API token from the Pod's service account
+      local secret_name="$1"
+      local data="$2"
+      local local_data_file="$3"
+      local sync_type="$4"
+    
+      if [ "$sync_type" == "new" ]; then
+        echo "$(date) - INFO - Creating new secret $secret_name in Kubernetes..."
+        cresponse=$(
+          echo "$data" | \
+          curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- \
+            "$KUBERNETES_API_SERVER/api/v1/namespaces/$NAMESPACE/secrets"
+        )
+        if [ "$cresponse" == "201" ]; then
+          echo "$(date) - INFO - Successfully created new secret: $secret_name"
+          ADDED_SECRETS+=("$secret_name")
+        else
+          echo "$(date) - ERROR - Failed to create secret: $secret_name"
+          echo "$(date) - ERROR - Failure Response: $cresponse"          
+        fi
+      elif [ "$sync_type" == "update" ]; then
+        echo "$(date) - INFO - Updating existing secret $secret_name in Kubernetes..."
+        cresponse=$(
+          echo "$data" | \
+          curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/merge-patch+json" \
+            --data-binary @- \
+            "$KUBERNETES_API_SERVER/api/v1/namespaces/$NAMESPACE/secrets/$secret_name"
+        )
+        if [ "$cresponse" == "200" ]; then
+          echo "$(date) - INFO - Successfully updated secret: $secret_name"
+          # Add secret name to the added/updated secrets array
+          ADDED_SECRETS+=("$secret_name")
+        else
+          echo "$(date) - ERROR - Failed to update secret: $secret_name"
+        fi
+      fi
+    
+      # Update local data file
+      cleaned_data=$(echo "$data" | jq -c '.data')
+      echo "$cleaned_data" > "$local_data_file"
+      echo "$(date) - INFO - Local data cache for $secret_name updated."
+    }
+    
+    # Create local data dir
+    mkdir -p "$LOCAL_DATA_DIR"
+    
+    # Authenticate with Vault if VAULT_ENABLED is true
+    if [ "$VAULT_ENABLED" == "true" ]; then
+      authenticate_with_vault
+    fi
+    
+    # Iterate over each syncPath with pathType: generic-secret, tls-secret, ca-secret, etc.
+    {{- range .Values.NiFiSync.syncPaths }}
+      {{- $syncPath := . }}
+      {{- $pathType := .pathType }}
+      {{- $secretType := (default $.Values.NiFiSync.DefaultSecretType $syncPath.secretType) | lower }}
+      # Common variables
+      {{- if eq $secretType "kubernetes" }}
+        SECRET_NAME="{{ template "apache-nifi.fullname" $ }}-{{ .pathName }}"
+        SECRET_TYPE="kubernetes"
+      {{- else if eq $secretType "vault" }}
+        SECRET_NAME="vault-{{ template "apache-nifi.fullname" $ }}-{{ .pathName }}"
+        SECRET_TYPE="vault"
+      {{- end }}
+      FOLDER_PATH="/tmp/sync{{ .localPath }}"
+      LOCAL_DATA_FILE="$LOCAL_DATA_DIR/$SECRET_NAME.json"
+      # Process based on pathType
+      {{- if eq $pathType "generic-secret" }}
+        ##########################################################
+        # GENERIC SECRET (Opaque)
+        ##########################################################
+        secret_pathtype="Opaque"
+        echo "$(date) - INFO - Processing Opaque Secret: $SECRET_NAME"
+    
+        # Use temp files instead of big shell variables
+        data_tmp_file=$(mktemp)
+        echo '{}' > "$data_tmp_file"
+    
+    
+        for file in "$FOLDER_PATH"/*; do
+          if [ -f "$file" ]; then
+            filename="$(basename "$file")"
+            file_content="$(encode_file "$file")"
+    
+            # Build up JSON using stdin + temp file
+            jq --arg k "$filename" --arg v "$file_content" '. + {($k): $v}' \
+              < "$data_tmp_file" \
+              > "$data_tmp_file.new"
+            mv "$data_tmp_file.new" "$data_tmp_file"
+    
+          fi
+        done
+    
+        # Construct final JSON with jq reading from stdin
+        data=$(jq --arg name "$SECRET_NAME" --arg namespace "$NAMESPACE" '
+          {
+            apiVer1sion: "v1",
+            kind: "Secret",
+            metadata: {
+              name: $name,
+              namespace: $namespace
+            },
+            type: "Opaque",
+            data: .
+          }
+        ' < "$data_tmp_file")
+    
+        datapayload=$(jq '{data: .}' < "$data_tmp_file")
+    
+        # Add to found secrets
+        FOUND_SECRETS+=("$SECRET_NAME")
+    
+        echo "$(date) - INFO - Starting Check Certs for Opaque Secret"
+        sync_task=$(check_certs "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$SECRET_TYPE")
+        echo "$(date) - INFO - ===================================="
+        echo "$(date) - INFO - Secret Name: $SECRET_NAME"
+        echo "$(date) - INFO - Sync Task: $sync_task"
+        echo "$(date) - INFO - Secret Type: $secret_pathtype"
+        echo "$(date) - INFO - Destination: $SECRET_TYPE"
+        echo "$(date) - INFO - ===================================="
+    
+        if [ "$sync_task" == "new" ] || [ "$sync_task" == "update" ]; then
+          echo "$(date) - INFO - Modifying Opaque Secret: $SECRET_NAME"
+          # Write the secret based on secretType
+          {{- if eq $secretType "kubernetes" }}
+            write_to_kubernetes "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$sync_task" 
+          {{- else if eq $secretType "vault" }}
+            write_to_vault "$SECRET_NAME" "$datapayload" "$LOCAL_DATA_FILE" "$sync_task" "$secret_pathtype"
+          {{- else }}
+            {{- fail "Invalid secretType '{{ $secretType }}' for syncPath '{{ $syncPath.pathName }}'. Allowed values are 'kubernetes' or 'vault'." }}
+          {{- end }}
+          echo "$(date) - INFO - Completed Processing Opaque Secret: $SECRET_NAME"
+          echo "$(date) - INFO - ===================================="
+        fi
+      {{- else if eq $pathType "tls-secret" }}
+        ##########################################################
+        # TLS SECRET (kubernetes.io/tls)
+        ##########################################################
+        secret_pathtype="kubernetes.io/tls"
+        # Process TLS Secret
+        echo "$(date) - INFO - Processing TLS Secret: $SECRET_NAME"
+
+        # Files expected: tls.crt and tls.key
+        crt_file="$FOLDER_PATH/tls.crt"
+        key_file="$FOLDER_PATH/tls.key"
+
+        if [[ ! -f "$crt_file" ]] || [[ ! -f "$key_file" ]]; then
+          echo "$(date) - ERROR - Both tls.crt and tls.key must be present in $FOLDER_PATH" >&2
+          continue
+        fi
+
+        # Encode the files
+        crt_content="$(encode_file "$crt_file")"
+        key_content="$(encode_file "$key_file")"
+    
+        # Build JSON in a temp file
+        tls_tmp_file=$(mktemp)
+        jq -n --arg crt "$crt_content" --arg key "$key_content" \
+           '{ "tls.crt": $crt, "tls.key": $key }' \
+           > "$tls_tmp_file"
+    
+        # Final K8s JSON
+        data=$(jq --arg name "$SECRET_NAME" --arg namespace "$NAMESPACE" '
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: {
+              name: $name,
+              namespace: $namespace
+            },
+            type: "kubernetes.io/tls",
+            data: .
+          }
+        ' < "$tls_tmp_file")
+    
+        datapayload=$(jq '{data: .}' < "$tls_tmp_file")
+    
+        FOUND_SECRETS+=("$SECRET_NAME")
+        echo "$(date) - INFO - Starting Check Certs for TLS Secret"
+        sync_task=$(check_certs "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$SECRET_TYPE")
+        echo "$(date) - INFO - ===================================="
+        echo "$(date) - INFO - Secret Name: $SECRET_NAME"
+        echo "$(date) - INFO - Sync Task: $sync_task"
+        echo "$(date) - INFO - Secret Type: $secret_pathtype"
+        echo "$(date) - INFO - Destination: $SECRET_TYPE"
+        echo "$(date) - INFO - ===================================="
+        if [ "$sync_task" == "new" ] || [ "$sync_task" == "update" ]; then
+          echo "$(date) - INFO - Modifying TLS Secret: $SECRET_NAME"
+          # Write the secret based on secretType
+          {{- if eq $secretType "kubernetes" }}
+            write_to_kubernetes "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$sync_task" 
+          {{- else if eq $secretType "vault" }}
+            write_to_vault "$SECRET_NAME" "$datapayload" "$LOCAL_DATA_FILE" "$sync_task" "$secret_pathtype"
+          {{- else }}
+            {{- fail "Invalid secretType '{{ $secretType }}' for syncPath '{{ $syncPath.pathName }}'. Allowed values are 'kubernetes' or 'vault'." }}
+          {{- end }}
+          echo "$(date) - INFO - Completed Processing TLS Secret: $SECRET_NAME"
+          echo "$(date) - INFO - ===================================="
+        fi
+
+
+      {{- else if eq $pathType "ca-secret" }}
+        ##########################################################
+        # CA SECRET (Opaque)
+        ##########################################################
+        secret_pathtype="Opaque"
+        echo "$(date) - INFO - Processing CA Secret: $SECRET_NAME"
+        
+        # Build CA cert data via tmpfile
+        ca_tmp_file=$(mktemp)
+        echo '{}' > "$ca_tmp_file"
+    
+        for cert_file in "$FOLDER_PATH"/*; do
+          if [ -f "$cert_file" ]; then
+            CERT_NAME=$(basename "$cert_file" | cut -f 1 -d '.')
+            CERT_NAME_LOWER=$(echo "$CERT_NAME" | tr '[:upper:]' '[:lower:]')
+            CERT_CONTENT=$(encode_file "$cert_file")
+            key_name="${CERT_NAME_LOWER}-ca.crt"
+    
+            # Append to JSON
+            jq --arg k "$key_name" --arg v "$CERT_CONTENT" '. + {($k): $v}' \
+              < "$ca_tmp_file" \
+              > "$ca_tmp_file.new"
+            mv "$ca_tmp_file.new" "$ca_tmp_file"
+          else
+            echo "$(date) - INFO - $cert_file is not a regular file. Skipping..."
+          fi
+        done
+    
+        data=$(jq --arg name "$SECRET_NAME" --arg namespace "$NAMESPACE" '
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: {
+              name: $name,
+              namespace: $namespace
+            },
+            type: "Opaque",
+            data: .
+          }
+        ' < "$ca_tmp_file")
+    
+        datapayload=$(jq '{data: .}' < "$ca_tmp_file")
+        # Add secret name to the found secrets array
+        FOUND_SECRETS+=("$SECRET_NAME")
+        echo "$(date) - INFO - Starting Check Certs for CA Secret"
+        sync_task=$(check_certs "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$SECRET_TYPE")
+        echo "$(date) - INFO - ===================================="
+        echo "$(date) - INFO - Secret Name: $SECRET_NAME"
+        echo "$(date) - INFO - Sync Task: $sync_task"
+        echo "$(date) - INFO - Secret Type: $secret_pathtype"
+        echo "$(date) - INFO - Destination: $SECRET_TYPE"
+        echo "$(date) - INFO - ===================================="
+
+        if [ "$sync_task" == "new" ] || [ "$sync_task" == "update" ]; then
+          echo "$(date) - INFO - Modifying CA Secret: $SECRET_NAME"
+          # Write the secret based on secretType
+          {{- if eq $secretType "kubernetes" }}
+            write_to_kubernetes "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$sync_task"
+          {{- else if eq $secretType "vault" }}
+            write_to_vault "$SECRET_NAME" "$datapayload" "$LOCAL_DATA_FILE" "$sync_task" "$secret_pathtype"
+          {{- else }}
+            {{- fail "Invalid secretType '{{ $secretType }}' for syncPath '{{ $syncPath.pathName }}'. Allowed values are 'kubernetes' or 'vault'." }}
+          {{- end }}
+          echo "$(date) - INFO - Completed Processing CA Secret: $SECRET_NAME"
+          echo "$(date) - INFO - ===================================="
+        fi
+
+      {{- end }}
+    {{- end }}
+
+    # Output the list of found and added/updated secrets
+    echo "$(date) - INFO - Found secrets: ${FOUND_SECRETS[*]}"
+    echo "$(date) - INFO - Added/Updated secrets: ${ADDED_SECRETS[*]}"
+    echo "$(date) - INFO - -------------------------- Completed Secret Sync --------------------------"
+
+---
+#This is to allow access to read/modify secrets in kubernetes
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+  namespace: {{ $.Release.Namespace }}
+automountServiceAccountToken: false
+---
+#This is to allow access to read/modify secrets in kubernetes
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier-token
+  namespace: {{ $.Release.Namespace }}
+  annotations:
+    kubernetes.io/service-account.name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+type: kubernetes.io/service-account-token
+---
+#This is to allow the default SA to access vault using it's token
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-default-token
+  namespace: {{ $.Release.Namespace }}
+  annotations:
+    kubernetes.io/service-account.name: default
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+  namespace: {{ $.Release.Namespace }}
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "update", "delete", "create", "patch"]
+{{/* 
+     SECURITY NOTE: This Role can read any secret in the namespace, 
+     which can seem excessive.  However, in mitigation,
+     this role's secret is only exposed to the sidecar that runs a 
+     simple script with minimal attack surface.
+
+     Additional commentary omitted for brevity.
+*/}}
+
+{{ if .Values.NiFiSync.vault.enabled }}
+---
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultAuth
+metadata:
+  name: vaultauth-{{ .Values.NiFiSync.vault.mount }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  namespace: {{ .Values.NiFiSync.vault.namespace }}
+  method: kubernetes
+  mount: {{ .Values.NiFiSync.vault.mount }}
+  kubernetes:
+    role: {{ .Values.NiFiSync.vault.role }}
+    serviceAccount: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-vault-secret-modifier
+rules:
+- apiGroups: ["secrets.hashicorp.com"]
+  resources: ["vaultstaticsecrets", "vaultauths"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-vault-secret-modifier
+rules:
+- apiGroups: ["secrets.hashicorp.com"]
+  resources: ["vaultstaticsecrets", "vaultauths"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-vault-secret-modifier
+subjects:
+- kind: ServiceAccount
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+  namespace: {{ $.Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ template "apache-nifi.fullname" $ }}-sync-vault-secret-modifier
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-vault-secret-modifier
+subjects:
+- kind: ServiceAccount
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+  namespace: {{ $.Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ template "apache-nifi.fullname" $ }}-sync-vault-secret-modifier
+  apiGroup: rbac.authorization.k8s.io
+  {{/* if .Values.NiFiSync.vault.enabled */}}{{ end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+  namespace: {{ $.Release.Namespace }}
+subjects:
+- kind: ServiceAccount
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+roleRef:
+  kind: Role
+  name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
+  apiGroup: rbac.authorization.k8s.io
+
+  {{/* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}

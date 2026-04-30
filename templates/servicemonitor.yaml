@@ -1,0 +1,148 @@
+{{- if .Values.metrics.prometheus.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ template "apache-nifi.fullname" . }}
+{{- with .Values.metrics.prometheus.serviceMonitor.namespace }}
+  namespace: {{ . }}
+{{- end }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+{{- if .Values.metrics.prometheus.serviceMonitor.labels }}
+{{ .Values.metrics.prometheus.serviceMonitor.labels | toYaml | indent 4 }}
+{{- end }}
+spec:
+  endpoints:
+    - port: https
+      scheme: https
+      tlsConfig:
+        ca:
+          secret:
+            key: ca.crt
+            name: {{ template "apache-nifi.fullname" $ }}-monitor
+        cert:
+          secret:
+            key: tls.crt
+            name: {{ template "apache-nifi.fullname" $ }}-monitor
+        keySecret:
+          key: tls.key
+          name: {{ template "apache-nifi.fullname" $ }}-monitor
+        serverName: localhost
+      honorLabels: true
+      path: "/nifi-api/flow/metrics/prometheus"
+{{- if .Values.metrics.prometheus.serviceMonitor.interval }}
+      interval: {{ .Values.metrics.prometheus.serviceMonitor.interval }}
+{{- end }}
+
+{{- /* 
+  Prepare variables before emitting metricRelabelings scalar.
+  This block builds a regex to filter Prometheus metrics based on static metric names,
+  specific component IDs, parent IDs, and component names.
+*/ -}}
+{{- $sm := .Values.metrics.prometheus.serviceMonitor }}
+{{- /* Static metric names to always keep */ -}}
+{{- $static := "nifi_version_info|cluster_connected_node_count|cluster_total_node_count|cluster_is_clustered|cluster_is_connected_to_cluster|nifi_jvm_.*" -}}
+{{- /* Lists of component IDs, parent IDs, and component names to keep, from values */ -}}
+{{- $cids := $sm.keepComponentIDs | default (list) -}}
+{{- $pids := $sm.keepParentIDs | default (list) -}}
+{{- $names := $sm.keepComponentNames | default (list) -}}
+{{- /* $alts will hold all regex alternatives for metrics to keep */ -}}
+{{- $alts := list -}}
+{{- /* Always keep static metrics */ -}}
+{{- $alts = append $alts (printf "^(?:%s).*" $static) -}}
+{{- /* Always keep metrics related to RootProcessGroup */ -}}
+{{- $alts = append $alts "^.*RootProcessGroup.*" -}}
+{{- /* If component IDs are provided, keep metrics matching those IDs */ -}}
+{{- if gt (len $cids) 0 }}
+  {{- $cidsRegex := join "|" $cids }}
+  {{- $alts = append $alts (printf "^.*\\|.*\\|(?:%s)\\|.*\\|.*$" $cidsRegex) }}
+{{- end }}
+{{- /* If parent IDs are provided, keep metrics matching those parent IDs */ -}}
+{{- if gt (len $pids) 0 }}
+  {{- $pidsRegex := join "|" $pids }}
+  {{- $alts = append $alts (printf "^.*\\|.*\\|.*\\|.*\\|(?:%s)$" $pidsRegex) }}
+{{- end }}
+{{- /* If component names are provided, clean and escape them, then keep matching metrics */ -}}
+{{- if gt (len $names) 0 }}
+  {{- $cleanNames := list }}
+  {{- range $n := $names }}
+    {{- /* Remove ^ and $ anchors, escape backslashes and pipes */ -}}
+    {{- $m := regexReplaceAll "(^\\^|\\$$)" $n "" }}
+    {{- $m = regexReplaceAll "\\\\" $m "\\\\" }}
+    {{- $m = regexReplaceAll "\\|" $m "\\|" }}
+    {{- $cleanNames = append $cleanNames $m }}
+  {{- end }}
+  {{- $alts = append $alts (printf "^.*(?:%s).*$" (join "|" $cleanNames)) }}
+{{- end }}
+{{- /* Join all alternatives into a single regex for metricRelabelings */ -}}
+{{- $finalRegex := join "|" $alts }}
+
+{{- if (default true $sm.filterEnabled) }}
+      metricRelabelings:
+        - sourceLabels: [__name__, component_type, component_id, component_name, parent_id]
+          separator: "|"
+          regex: >-
+{{- $finalRegex | nindent 12 }}
+          action: keep
+
+        - action: labeldrop #remove after 2.8.0
+          regex: instance_id
+
+        #- action: replace
+        #  sourceLabels: [pod]
+        #  targetLabel: instance
+        #  replacement: '$1'
+
+        - action: labeldrop
+          regex: connected_nodes
+{{- end }}
+
+{{- if .Values.metrics.prometheus.serviceMonitor.metricRelabelings }}
+{{ tpl (toYaml .Values.metrics.prometheus.serviceMonitor.metricRelabelings | indent 6) . }}
+{{- end }}
+
+      relabelings:
+        - action: replace
+          regex: (.*);(.*);(.*)
+          replacement: $1.{{ template "apache-nifi.fullname" $ }}-headless.$2.svc.cluster.local:$3
+          separator: ;
+          sourceLabels:
+            - pod
+            - namespace
+            - __meta_kubernetes_pod_container_port_number
+          targetLabel: __address__
+        - action: replace
+          replacement: {{ printf "%s://%s" (include "nifi.ingress.scheme" .) .Values.properties.webProxyHost | quote }}
+          targetLabel: nifi_url          
+        - action: replace
+          replacement: {{ .Values.labels.appid | toString | quote }}
+          targetLabel: appid
+        - action: replace
+          replacement: {{ .Values.labels.environment | toString | quote }}
+          targetLabel: env
+        - action: replace
+          replacement: {{ .Values.labels.region | toString | quote }}
+          targetLabel: region
+        - action: replace
+          replacement: {{ .Values.labels.owner | toString | quote }}
+          targetLabel: owner
+{{- if .Values.metrics.prometheus.serviceMonitor.relabelings }}
+
+{{ toYaml .Values.metrics.prometheus.serviceMonitor.relabelings | indent 6 }}
+{{- end }}
+  selector:
+    matchExpressions:
+      - key: headless
+        operator: DoesNotExist
+    matchLabels:
+      app: {{ template "apache-nifi.name" . }}
+      release: {{ .Release.Name }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace | quote }}
+{{- end }}

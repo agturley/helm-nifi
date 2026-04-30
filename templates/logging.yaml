@@ -1,0 +1,33 @@
+{{ if .Values.Logging.enabled }}
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: Flow
+metadata:
+  name: {{ template "apache-nifi.fullname" $ }}-logging
+  namespace: {{ $.Release.Namespace }}
+
+spec:
+  filters:
+    - concat:
+        continuous_line_regexp: /^[^0-9]+.*/
+        multiline_start_regexp: /^[^ ]+ [^ ]+,[0-9]+.*/
+    - parser:
+        parse:
+          keep_time_key: true
+          patterns:
+            - expression: >-
+                /(?<timestamp>\d{4}-\d{2}-\d{2}
+                \d{2}:\d{2}:\d{2},\d{3})\s+(?<level>\w+)\s+\[(?<thread>.*?)\]\s+(?<logger>\S+)\s+(?<message>[^\r\n]*)(?:\r?\n(?<stacktrace>[\s\S]+))?/
+              format: regexp
+          type: multi_format
+        reserve_data: true
+
+  globalOutputRefs:
+    - {{ .Values.Logging.clusterOutput }}
+  match:
+    - select:
+        container_names:
+          - app-log
+          - bootstarp-log
+          - user-log
+
+{{/* if .Values.Logging.enabled */}}{{ end }}
