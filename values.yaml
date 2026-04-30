@@ -406,6 +406,7 @@ auth:
   singleUser:
     username: username
     password: "password1234" #changeme_secret # Must to have at least 12 characters
+    generateSecret: false # If true, generates a random password (and username if not set) stored in a K8s Secret; username above is used when provided
 
   clientAuth:
     enabled: false
@@ -444,22 +445,6 @@ auth:
     ## Request additional scopes, for example profile
     additionalScopes:
 
-openldap:
-  enabled: false
-  persistence:
-    enabled: true
-  env:
-    LDAP_ORGANISATION: # name of your organization e.g. "Example"
-    LDAP_DOMAIN: # your domain e.g. "ldap.example.be"
-    LDAP_BACKEND: "hdb"
-    LDAP_TLS: "true"
-    LDAP_TLS_ENFORCE: "false"
-    LDAP_REMOVE_CONFIG_AFTER_SETUP: "false"
-  adminPassword: "adminPassword" #ChangeMe
-  configPassword: "configPassword" #ChangeMe
-  customLdifFiles:
-    1-default-users.ldif: |-
-      # You can find an example ldif file at https://github.com/cetic/fadi/blob/master/examples/basic/example.ldif
 ## Expose the nifi service to be accessed from outside the cluster (LoadBalancer service).
 ## or access it from within the cluster (ClusterIP service). Set the service type and the port to serve it.
 ## ref: http://kubernetes.io/docs/user-guide/services/
@@ -695,26 +680,6 @@ openshift:
     #path: /nifi
 
 # ca server details
-# Setting this true would create a nifi-toolkit based ca server
-# The ca server will be used to generate self-signed certificates required setting up secured cluster
-ca:
-  ## If true, enable the nifi-toolkit certificate authority
-  enabled: false
-  persistence:
-    enabled: true
-  server: ""
-  service:
-    port: 9090
-  token: sixteenCharacters
-  admin:
-    cn: admin
-  serviceAccount:
-    create: false
-    #name: nifi-ca
-  openshift:
-    scc:
-      enabled: false
-
 # cert-manager support
 # Setting this true will have cert-manager create a private CA for the cluster
 # as well as the certificates for each cluster node.
@@ -781,17 +746,6 @@ zookeeper:
   # Explicitly set as empty list to avoid Helm coalescing tra-nifi's top-level
   # initContainers: {} (map) into this subchart where a list is expected.
   initContainers: []
-# ------------------------------------------------------------------------------
-# Nifi registry:
-# ------------------------------------------------------------------------------
-registry:
-  ## If true, install the Nifi registry
-  enabled: false
-  url: ""
-  port: 80
-  ## Add values for the nifi-registry here
-  ## ref: https://github.com/dysnix/charts/blob/main/dysnix/nifi-registry/values.yaml
-
 # Configure metrics
 metrics:
   prometheus:

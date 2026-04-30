@@ -1,0 +1,17 @@
+# Patterns to ignore when building packages.
+.git
+.gitignore
+.helmignore
+.DS_Store
+
+# Documentation and images
+doc/
+
+# Temporary helm dependency directories
+tmpcharts-*/
+
+# Tests
+tests/
+
+# Markdown files
+*.md

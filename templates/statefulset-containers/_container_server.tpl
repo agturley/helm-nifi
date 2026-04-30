@@ -191,6 +191,8 @@
 {{- else if .Values.auth.clientAuth.enabled }}
           cat "${NIFI_HOME}/conf/authorizers.temp" > "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --delete "//authorizers/authorizer[identifier='single-user-authorizer']" "${NIFI_HOME}/conf/authorizers.xml"
+{{- else if .Values.auth.singleUser.generateSecret }}
+          bin/nifi.sh set-single-user-credentials "${NIFI_SINGLE_USER_USERNAME}" "${NIFI_SINGLE_USER_PASSWORD}"
 {{- else if .Values.auth.singleUser.username }}
           bin/nifi.sh set-single-user-credentials {{ .Values.auth.singleUser.username }} {{ .Values.auth.singleUser.password }}
 {{- end }}
@@ -411,6 +413,18 @@
 {{- end }}
 {{- if .Values.env }}
 {{ toYaml .Values.env | indent 8 }}
+{{- end }}
+{{- if .Values.auth.singleUser.generateSecret }}
+        - name: NIFI_SINGLE_USER_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "apache-nifi.fullname" . }}-single-user-credentials
+              key: username
+        - name: NIFI_SINGLE_USER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "apache-nifi.fullname" . }}-single-user-credentials
+              key: password
 {{- end }}
 
 #vault envFrom
