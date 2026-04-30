@@ -58,6 +58,12 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
         secret:
           secretName: {{ .Values.properties.secretsName }}
       {{- end }}
+      {{- if .Values.auth.singleUser.generateSecret }}
+      - name: single-user-credentials
+        secret:
+          secretName: {{ include "apache-nifi.fullname" . }}-single-user-credentials
+          defaultMode: 0440
+      {{- end }}
 
       - name: "bootstrap-conf"
         configMap:

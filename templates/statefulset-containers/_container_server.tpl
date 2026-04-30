@@ -192,7 +192,9 @@
           cat "${NIFI_HOME}/conf/authorizers.temp" > "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --delete "//authorizers/authorizer[identifier='single-user-authorizer']" "${NIFI_HOME}/conf/authorizers.xml"
 {{- else if .Values.auth.singleUser.generateSecret }}
-          bin/nifi.sh set-single-user-credentials "${NIFI_SINGLE_USER_USERNAME}" "${NIFI_SINGLE_USER_PASSWORD}"
+          bin/nifi.sh set-single-user-credentials \
+            "$(tr -d '\r\n' < /opt/nifi/single-user-credentials/username)" \
+            "$(tr -d '\r\n' < /opt/nifi/single-user-credentials/password)"
 {{- else if .Values.auth.singleUser.username }}
           bin/nifi.sh set-single-user-credentials {{ .Values.auth.singleUser.username }} {{ .Values.auth.singleUser.password }}
 {{- end }}
@@ -414,18 +416,6 @@
 {{- if .Values.env }}
 {{ toYaml .Values.env | indent 8 }}
 {{- end }}
-{{- if .Values.auth.singleUser.generateSecret }}
-        - name: NIFI_SINGLE_USER_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "apache-nifi.fullname" . }}-single-user-credentials
-              key: username
-        - name: NIFI_SINGLE_USER_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "apache-nifi.fullname" . }}-single-user-credentials
-              key: password
-{{- end }}
 
 #vault envFrom
 {{- /* collect Vault secrets with secretMode=env for envFrom */ -}}
@@ -560,6 +550,11 @@
       {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") }}
           - name: k8s-secrets
             mountPath: {{ .Values.properties.secretsFilePath }}
+            readOnly: true
+      {{- end }}
+      {{- if .Values.auth.singleUser.generateSecret }}
+          - name: single-user-credentials
+            mountPath: /opt/nifi/single-user-credentials
             readOnly: true
       {{- end }}
 
