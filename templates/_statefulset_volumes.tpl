@@ -50,7 +50,7 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
           name: {{ .Release.Name }}-aws-secrets-sync-config
       - name: aws-secrets-sync-script
         configMap:
-          name: aws-secrets-sync-script
+          name: {{ .Release.Name }}-aws-secrets-sync-script
           defaultMode: 0550
       {{- end }}
       {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") }}
