@@ -47,7 +47,7 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
         emptyDir: {}
       - name: aws-secrets-sync-config
         configMap:
-          name: aws-secrets-sync-config
+          name: {{ .Release.Name }}-aws-secrets-sync-config
       - name: aws-secrets-sync-script
         configMap:
           name: aws-secrets-sync-script
