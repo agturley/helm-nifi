@@ -203,7 +203,7 @@
           prop_replace nifi.remote.input.host ${FQDN}
           prop_replace nifi.cluster.node.address ${FQDN}
           prop_replace nifi.zookeeper.connect.string ${NIFI_ZOOKEEPER_CONNECT_STRING}
-          prop_replace nifi.web.http.host ${FQDN}
+          prop_replace nifi.web.http.host "$(hostname).{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}"
 
 {{- if .Values.properties.kerberosKrb5Path }}
           prop_replace nifi.kerberos.krb5.file {{ .Values.properties.kerberosKrb5Path }}
@@ -246,7 +246,7 @@
           prop_replace nifi.cluster.node.address "$(hostname).{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}"
           prop_replace nifi.web.https.network.interface.default eth0
           prop_replace nifi.web.https.network.interface.lo lo
-          prop_replace nifi.web.http.host ""
+          prop_replace nifi.web.http.host "$(hostname).{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}"
           prop_replace nifi.web.http.port ""
 
           prop_replace nifi.security.autoreload.enabled true
@@ -286,6 +286,12 @@
           fi
 
 {{- /* if .Values.certManager.enabled */}}{{ end }}
+
+{{- if .Values.properties.httpPort }}
+          prop_replace nifi.web.http.host "$(hostname).{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}"
+          prop_replace nifi.web.http.port {{ .Values.properties.httpPort }}
+          prop_replace nifi.web.https.port ""
+{{- end }}
 
 {{- if .Values.properties.safetyValve }}
   {{- range $prop, $val := .Values.properties.safetyValve }}
@@ -394,7 +400,7 @@
         resources:
 {{ toYaml .Values.resources | indent 10 }}
         ports:
-        - containerPort: {{ .Values.properties.httpsPort }}
+        - containerPort: {{ include "apache-nifi.webPort" . }}
 {{- if .Values.sts.hostPort }}
           hostPort: {{ .Values.sts.hostPort }}
 {{- end }}
@@ -409,7 +415,10 @@
         env:
         - name: NIFI_ZOOKEEPER_CONNECT_STRING
           value: {{ template "zookeeper.url" . }}
-{{- if not (or (.Values.auth.ldap.enabled) (.Values.auth.oidc.enabled)) }}
+{{- if .Values.properties.httpPort }}
+        - name: NIFI_WEB_HTTP_HOST
+          value: 0.0.0.0
+{{- else if not (or (.Values.auth.ldap.enabled) (.Values.auth.oidc.enabled)) }}
         - name: NIFI_WEB_HTTPS_HOST
           value: 0.0.0.0
 {{- end }}
@@ -482,7 +491,7 @@
 {{- end }}
           periodSeconds: 20
           tcpSocket:
-            port: {{ .Values.properties.httpsPort }}
+            port: {{ include "apache-nifi.webPort" . }}
 #           exec:
 #             command:
 #             - bash
@@ -510,7 +519,7 @@
           failureThreshold: {{ .Values.sts.startupProbe.failureThreshold }}
           periodSeconds: {{ .Values.sts.startupProbe.periodSeconds }}
           tcpSocket:
-            port: {{ .Values.properties.httpsPort }}
+            port: {{ include "apache-nifi.webPort" . }}
 {{- end }}
         livenessProbe:
 {{- if not .Values.sts.startupProbe.enabled }}
@@ -518,7 +527,7 @@
 {{- end }}
           periodSeconds: 60
           tcpSocket:
-            port: {{ .Values.properties.httpsPort }}
+            port: {{ include "apache-nifi.webPort" . }}
         volumeMounts:
       # VaultSecretMounts
       {{- $vals := .Values.VaultNiFiSecrets }}

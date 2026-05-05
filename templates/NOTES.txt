@@ -12,6 +12,6 @@
 To access the NiFi UI via kubectl port forwarding,
 wait until the cluster is ready and then run:
 
-kubectl port-forward -n {{ .Release.Namespace}} svc/{{ .Release.Name }} {{ .Values.service.httpsPort }}:{{ .Values.service.httpsPort }}
+kubectl port-forward -n {{ .Release.Namespace}} svc/{{ .Release.Name }} {{ include "apache-nifi.webPort" . }}:{{ include "apache-nifi.webPort" . }}
 
-...and point your web browser to https://localhost:{{ .Values.service.httpsPort }}/nifi/
+...and point your web browser to {{ if .Values.properties.httpPort }}http{{ else }}https{{ end }}://localhost:{{ include "apache-nifi.webPort" . }}/nifi/

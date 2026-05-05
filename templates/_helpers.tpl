@@ -112,6 +112,17 @@ Create chart name and version as used by the chart label.
 Form the Zookeeper Server part of the URL. If zookeeper is installed as part of this chart, use k8s service discovery,
 else use user-provided server name
 */}}
+{{/*
+Resolve the active NiFi web port — httpPort when set (HTTP-only mode), else httpsPort.
+*/}}
+{{- define "apache-nifi.webPort" -}}
+{{- if .Values.properties.httpPort -}}
+{{ .Values.properties.httpPort }}
+{{- else -}}
+{{ .Values.properties.httpsPort }}
+{{- end -}}
+{{- end -}}
+
 {{- define "zookeeper.server" }}
 {{- if .Values.zookeeper.enabled -}}
 {{- printf "%s-zookeeper" .Release.Name }}

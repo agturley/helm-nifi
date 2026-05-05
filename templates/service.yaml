@@ -18,7 +18,7 @@ spec:
   type: {{ .Values.headless.type }}
   clusterIP: None
   ports:
-  - port: {{ .Values.properties.httpsPort }}
+  - port: {{ include "apache-nifi.webPort" . }}
     name: https
   - port: {{ .Values.properties.clusterPort }}
     name: cluster
@@ -62,9 +62,9 @@ spec:
   {{- end }}
   {{- end }}
   ports:
-    - port: {{ .Values.service.httpsPort }}
+    - port: {{ include "apache-nifi.webPort" . }}
       name: https
-      targetPort: {{ .Values.properties.httpsPort }}
+      targetPort: {{ include "apache-nifi.webPort" . }}
       nodePort: {{ .Values.service.nodePort }}
     - port: {{ .Values.properties.siteToSite.port }}
       name: site-to-site
