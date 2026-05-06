@@ -397,7 +397,7 @@ NiFiSync:
 # Nifi User Authentication
 auth:
   # If set while LDAP is enabled, this value will be used for the initial admin and not the ldap bind dn / admin
-  admin: CN=admin, OU=NIFI
+  admin: CN=admin
   SSL:
     keystorePasswd: "keystorePasswd" #changeMe_secret
     truststorePasswd: "truststorePasswd" #changeMe_secret
@@ -606,6 +606,9 @@ logresources:
   limits:
     cpu: 50m
     memory: 50Mi
+zookeeperInit:
+  # Set to false to skip the zookeeper connectivity init container
+  enabled: false
 zookeeperResources: #built in zookeeper sidecar container resources NOT the external zookeeper
   requests:
     cpu: 10m
@@ -735,6 +738,9 @@ zookeeper:
   ## If the Zookeeper Chart is disabled a URL and port are required to connect
   url: ""
   port: 2181
+  ## Optional: override the full connect string (e.g. "host1:2181,host2:2181").
+  ## If set, this takes precedence over the auto-generated value.
+  # connectString: ""
   replicaCount: 3
   resources:
     limits:

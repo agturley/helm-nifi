@@ -121,15 +121,27 @@ else use user-provided server name
 {{- end -}}
 
 {{/*
-Form the Zookeeper URL and port. If zookeeper is installed as part of this chart, use k8s service discovery,
-else use user-provided name and port
+Form the Zookeeper URL and port. If zookeeper is installed as part of this chart, build a
+comma-separated list of individual pod addresses via the headless service so NiFi connects
+directly to each ZooKeeper node rather than the cluster service.
+Otherwise use the user-provided URL and port.
 */}}
 {{- define "zookeeper.url" }}
+{{- if .Values.zookeeper.connectString -}}
+{{- .Values.zookeeper.connectString }}
+{{- else -}}
 {{- $port := .Values.zookeeper.port | toString }}
 {{- if .Values.zookeeper.enabled -}}
-{{- printf "%s-zookeeper:%s" .Release.Name $port }}
+{{- $name := .Release.Name -}}
+{{- $headless := printf "%s-zookeeper-headless" .Release.Name -}}
+{{- $nodes := list -}}
+{{- range until (int .Values.zookeeper.replicaCount) -}}
+{{- $nodes = append $nodes (printf "%s-zookeeper-%d.%s:%s" $name . $headless $port) -}}
+{{- end -}}
+{{- join "," $nodes }}
 {{- else -}}
 {{- printf "%s:%s" .Values.zookeeper.url $port }}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

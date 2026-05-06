@@ -3,7 +3,7 @@
 
 # Prometheus is enabled. 
 # Add the following user to NiFi
-# CN={{ template "apache-nifi.fullname" $ }}-monitor.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}, OU=NIFI
+# CN={{ template "apache-nifi.fullname" $ }}-monitor.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}
 # Add this user to the policy "view the user interface"
 {{- end}}
 
