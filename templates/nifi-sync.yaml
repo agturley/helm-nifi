@@ -53,9 +53,9 @@ data:
 
     # Environment-configurable flags
     ENABLE_MANAGED_GROUPS = os.getenv("ENABLE_MANAGED_GROUPS", "true").lower() in ("1", "true", "yes")
-    MONITORING_USER = 'CN={{ template "apache-nifi.fullname" $ }}-monitor'
+    MONITORING_USER = 'CN={{ template "apache-nifi.fullname" $ }}-monitor{{ include "nifi.nodeOU" $ }}'
     REPLICA_COUNT = {{ .Values.replicaCount }}
-    NODE_USER_TEMPLATE = 'CN={{ template "apache-nifi.fullname" $ }}-{i}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}'
+    NODE_USER_TEMPLATE = 'CN={{ template "apache-nifi.fullname" $ }}-{i}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}{{ include "nifi.nodeOU" $ }}'
 
     # Namespace for deterministic UUID5
     default_namespace = uuid.uuid5(uuid.NAMESPACE_DNS, "nifi-sync")

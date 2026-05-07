@@ -50,6 +50,10 @@ Define required labels. These are used to help identify workloads and enhance mo
 {{/*
 Define is cluster is using http or https
 */}}
+{{- define "nifi.nodeOU" -}}
+{{- if .Values.certManager.nodeOU -}}, OU={{ .Values.certManager.nodeOU }}{{- end -}}
+{{- end -}}
+
 {{- define "nifi.ingress.scheme" -}}
 {{- if and .Values.ingress.tls (gt (len .Values.ingress.tls) 0) -}}
 https

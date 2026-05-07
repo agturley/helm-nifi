@@ -48,7 +48,7 @@
         <property name="Users File">./auth-conf/users.xml</property>
         <property name="Legacy Authorized Users File"></property>
         {{- range $i := until $replicas }}
-        <property name="Initial User Identity {{ $i }}">CN={{ $fullname }}-{{ $i }}.{{ $fullname }}-headless.{{ $namespace }}.svc.cluster.local</property>
+        <property name="Initial User Identity {{ $i }}">CN={{ $fullname }}-{{ $i }}.{{ $fullname }}-headless.{{ $namespace }}.svc.cluster.local{{ include "nifi.nodeOU" $ }}</property>
         {{- end }}
         {{- if and .Values.auth.ldap.enabled (not .Values.auth.admin) }}
         <property name="Initial User Identity admin">{{.Values.auth.ldap.admin}}</property>
@@ -237,7 +237,7 @@
         {{- end}}
         <property name="Legacy Authorized Users File"></property>
         {{- range $i := until $replicas }}
-        <property name="Node Identity {{ $i }}">CN={{ $fullname }}-{{ $i }}.{{ $fullname }}-headless.{{ $namespace }}.svc.cluster.local</property>
+        <property name="Node Identity {{ $i }}">CN={{ $fullname }}-{{ $i }}.{{ $fullname }}-headless.{{ $namespace }}.svc.cluster.local{{ include "nifi.nodeOU" $ }}</property>
         {{- end }}
         <property name="Node Identity"></property>
     </accessPolicyProvider>

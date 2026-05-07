@@ -688,6 +688,9 @@ openshift:
 # as well as the certificates for each cluster node.
 certManager:
   enabled: false
+  # Optional OU appended to auto-generated node/monitor certificate identities.
+  # e.g. set to "NIFI" to produce "CN=..., OU=NIFI". Leave empty to omit the OU.
+  nodeOU: "NIFI"
   # When true (default), the chart creates cert-manager Issuer and Certificate
   # resources to automatically provision TLS secrets for each NiFi node.
   # Set to false to supply the secrets manually (e.g. when cert-manager CRD
