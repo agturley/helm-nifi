@@ -404,7 +404,7 @@
 {{- if .Values.sts.hostPort }}
           hostPort: {{ .Values.sts.hostPort }}
 {{- end }}
-          name: https
+          name: {{ include "apache-nifi.webPortName" . }}
           protocol: TCP
         - containerPort: {{ .Values.properties.clusterPort }}
           name: cluster

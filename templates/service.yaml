@@ -19,11 +19,14 @@ spec:
   clusterIP: None
   ports:
   - port: {{ include "apache-nifi.webPort" . }}
-    name: https
+    name: {{ include "apache-nifi.webPortName" . }}
+    protocol: TCP
   - port: {{ .Values.properties.clusterPort }}
     name: cluster
+    protocol: TCP
   - port: {{ .Values.properties.siteToSite.port }}
     name: site-to-site
+    protocol: TCP
   selector:
     app: {{ include "apache-nifi.name" . | quote }}
     release: {{ .Release.Name | quote }}
@@ -63,12 +66,14 @@ spec:
   {{- end }}
   ports:
     - port: {{ include "apache-nifi.webPort" . }}
-      name: https
+      name: {{ include "apache-nifi.webPortName" . }}
       targetPort: {{ include "apache-nifi.webPort" . }}
+      protocol: TCP
       nodePort: {{ .Values.service.nodePort }}
     - port: {{ .Values.properties.siteToSite.port }}
       name: site-to-site
       targetPort: {{ .Values.properties.siteToSite.port }}
+      protocol: TCP
   {{- if .Values.properties.siteToSite.nodePort }}
       nodePort: {{ .Values.properties.siteToSite.nodePort }}
   {{- end }}
@@ -78,6 +83,7 @@ spec:
     - port: {{ .port }}
       name: {{ .name }}
       targetPort: {{ .targetPort }}
+      protocol: TCP
       {{- if eq $.Values.service.type "NodePort" }}
       nodePort: {{ .nodePort }}
       {{- end }}

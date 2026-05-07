@@ -123,6 +123,14 @@ Resolve the active NiFi web port — httpPort when set (HTTP-only mode), else ht
 {{- end -}}
 {{- end -}}
 
+{{- define "apache-nifi.webPortName" -}}
+{{- if .Values.properties.httpPort -}}
+http
+{{- else -}}
+https
+{{- end -}}
+{{- end -}}
+
 {{- define "zookeeper.server" }}
 {{- if .Values.zookeeper.enabled -}}
 {{- printf "%s-zookeeper" .Release.Name }}
