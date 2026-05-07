@@ -8,6 +8,12 @@
         <property name="Partitions">16</property>
         <property name="Checkpoint Interval">2 mins</property>
     </local-provider>
+{{- if .Values.kubernetesClusterState.enabled }}
+    <cluster-provider>
+        <id>kubernetes-provider</id>
+        <class>org.apache.nifi.kubernetes.state.provider.KubernetesConfigMapStateProvider</class>
+    </cluster-provider>
+{{- else }}
     <cluster-provider>
         <id>zk-provider</id>
         <class>org.apache.nifi.controller.state.providers.zookeeper.ZooKeeperStateProvider</class>
@@ -16,4 +22,5 @@
         <property name="Session Timeout">10 seconds</property>
         <property name="Access Control">Open</property>
     </cluster-provider>
+{{- end }}
 </stateManagement>

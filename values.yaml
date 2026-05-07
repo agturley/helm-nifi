@@ -729,6 +729,18 @@ certManager:
   caDuration: 87660h
 
 # ------------------------------------------------------------------------------
+# Kubernetes-native clustering (NiFi 2.x+)
+# When enabled, NiFi uses Kubernetes Leases for leader election and ConfigMaps
+# for cluster state instead of ZooKeeper.  Set zookeeper.enabled: false and
+# sts.serviceAccount.create: true when using this mode.
+# ------------------------------------------------------------------------------
+kubernetesClusterState:
+  enabled: false
+  # Optional prefix applied to Lease resource names — useful when multiple NiFi
+  # clusters share the same namespace.
+  leasePrefix: ""
+
+# ------------------------------------------------------------------------------
 # Zookeeper:
 # ------------------------------------------------------------------------------
 zookeeper:
