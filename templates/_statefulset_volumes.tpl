@@ -151,15 +151,17 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
       - name: nifisync-scripts
         configMap:
           name: {{ template "apache-nifi.fullname" $ }}-nifisync-scripts
+{{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}
+{{- if eq (include "nifi.secretSyncEnabled" .) "true" }}
       - name: secret-modifier-token
         secret:
           secretName: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier-token
-{{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}
-{{- if .Values.NiFiSync.s3Sync.enabled }}
+{{- end }}
+{{- if eq (include "nifi.secretSyncEnabled" .) "true" }}
     {{- range .Values.NiFiSync.syncPaths }}
     {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
       - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
-        secret: 
+        secret:
     {{- $secretType := (default $.Values.NiFiSync.DefaultSecretType .secretType) | lower }}
     {{- if eq $secretType "kubernetes" }}
           secretName: {{ template "apache-nifi.fullname" $ }}-{{ .pathName }}

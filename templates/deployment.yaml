@@ -1,4 +1,4 @@
-{{ if .Values.NiFiSync.s3Sync.enabled }}
+{{ if eq (include "nifi.secretSyncEnabled" .) "true" }}
 ---
 apiVersion: apps/v1
 kind: Deployment

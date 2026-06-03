@@ -558,8 +558,7 @@ data:
         main()
 {{/* end UserPolicySync.enabled */}}{{ end }}
 
-
-
+{{- if eq (include "nifi.secretSyncEnabled" $) "true" }}
   create-secrets-vault.sh: |
     #!/bin/bash
     echo "INFO - -------------------------- Starting Generic secret sync --------------------------"
@@ -1105,6 +1104,7 @@ data:
     echo "INFO - Found secrets: ${FOUND_SECRETS[*]}"
     echo "INFO - Added/Updated secrets: ${ADDED_SECRETS[*]}"
     echo "INFO - -------------------------- Completed Secret Sync --------------------------"
+{{- end }}{{/* secretSyncEnabled: create-secrets-vault.sh */}}
 {{- if .Values.NiFiSync.s3Sync.enabled }}
 
   s3sync.py: |
@@ -1659,6 +1659,7 @@ data:
     if __name__ == "__main__":
         main()
 {{- end }}
+{{- if eq (include "nifi.secretSyncEnabled" $) "true" }}
 
 ---
 #This is to allow access to read/modify secrets in kubernetes
@@ -1779,5 +1780,6 @@ roleRef:
   kind: Role
   name: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier
   apiGroup: rbac.authorization.k8s.io
+{{- end }}{{/* secretSyncEnabled: RBAC */}}
 
-  {{/* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}
+  {{/* if or s3Sync.enabled UserPolicySync.enabled */}}{{ end }}

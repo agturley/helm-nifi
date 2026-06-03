@@ -365,6 +365,14 @@ NiFiSync:
   s3Sync:
     enable: false
     syncInterval: 1d
+    # secretSync controls the separate "config-sync" Deployment that pulls the
+    # non-fs syncPaths (generic-secret/tls-secret/ca-secret) from S3 and writes
+    # them as Kubernetes secrets. It (and its RBAC) is only rendered when
+    # enabled here AND at least one enabled syncPath is a non-fs type, so it is
+    # skipped automatically when there are no secrets to sync. Set enabled:false
+    # to keep fs sync / flow backup while disabling the K8s secret sync entirely.
+    secretSync:
+      enabled: true
     # User adjustable endpoint for S3-compatible services (AWS, MinIO, etc.)
     endpoint: https://s3.us-east-1.amazonaws.com # Default AWS S3 URL. Replace for MinIO.
     bucket: mybucket

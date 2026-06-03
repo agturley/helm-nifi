@@ -559,14 +559,14 @@
             readOnly: true
       {{- end }}
 
-    {{- if .Values.NiFiSync.s3Sync.enabled}}
+    {{- if eq (include "nifi.secretSyncEnabled" $) "true" }}
         {{- range .Values.NiFiSync.syncPaths }}
         {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
             mountPath: {{ .localPath }}
         {{- end }}
         {{- end }}
-    {{- /* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}
+    {{- /* if nifi.secretSyncEnabled */}}{{ end }}
     {{- if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled}}
           - mountPath: /opt/nifi/nifi-sync/scripts
             name: nifisync-scripts
