@@ -323,10 +323,18 @@ NiFiSync:
   syncPaths:
     # Each path supports an optional 'enabled' field (default: true).
     # Set 'enabled: false' to skip a path without removing it from the config.
+    #
+    # For pathType: fs, an optional 'deleteOrphans' field (default: false)
+    # removes local files that are no longer present in S3 (like `mc mirror
+    # --remove`). For safety it is skipped whenever S3 is unreachable or the
+    # remote prefix returns no objects, so the local folder is never wiped due
+    # to an outage or a misconfigured bucket/prefix. Leave false for additive
+    # paths (e.g. driver jars in use); enable for paths you want mirrored exactly.
     - pathName: custom-drivers
       localPath: /opt/nifi/data/custom/drivers
       remotePath: custom/drivers
       pathType: fs
+      deleteOrphans: false
     - pathName: custom-extensions
       localPath: /opt/nifi/data/custom/extensions
       remotePath: custom/extensions

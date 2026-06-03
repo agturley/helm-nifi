@@ -178,6 +178,17 @@ spec:
         args:
         - |
           #!/bin/sh
+          # --- Prefix every stdout/stderr line with an ISO-8601 UTC timestamp ---
+          # Routes all output (including raw stderr from sub-tools like base64)
+          # through one timestamper so every log line is machine-parseable.
+          if _ts_fifo="$(mktemp -u /tmp/ts.XXXXXX)" && mkfifo "$_ts_fifo" 2>/dev/null; then
+            while IFS= read -r _ts_line; do
+              printf '%s - %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_ts_line"
+            done < "$_ts_fifo" &
+            exec > "$_ts_fifo" 2>&1
+            rm -f "$_ts_fifo"
+          fi
+          # --- end timestamp wrapper ---
 {{- /* START Wait for vault sidecar HTTP readiness on /ready (tries curl, wget, nc, falls back to port check) */ -}}
 {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           wait_for_sidecar_http_ready() {
@@ -294,7 +305,7 @@ spec:
           {{- range .Values.NiFiSync.syncPaths }}
           # Sync Secrets
           {{- if ne .pathType "fs" }}
-          echo "$(date) - INFO - Sync Secret Path: {{ .localPath }} with S3: $S3_BUCKET/$instanceName/{{ .remotePath }}"
+          echo "INFO - Sync Secret Path: {{ .localPath }} with S3: $S3_BUCKET/$instanceName/{{ .remotePath }}"
 
           if [ ! -d "/tmp/sync{{ .localPath }}" ]; then
             mkdir -p /tmp/sync{{ .localPath }}
@@ -302,41 +313,41 @@ spec:
 
           # Check if remote path exists in S3, if not, create it by uploading an empty placeholder
           if ! python3 "$S3SYNC" prefix-exists --remote "$instanceName/{{ .remotePath }}"; then
-            echo "$(date) - INFO - Creating Remote Path $instanceName/{{ .remotePath }} in S3"
+            echo "INFO - Creating Remote Path $instanceName/{{ .remotePath }} in S3"
             python3 "$S3SYNC" put-placeholder --remote "$instanceName/{{ .remotePath }}"
           fi
           {{- end }}
           # END Sync Secrets
           {{- end }}
           while true; do
-            echo "$(date) - INFO --------------------------- Starting S3 to Kubernetes Secrets Sync Process --------------------------"
-            echo "$(date) - INFO --------------------------- Starting S3 File Sync --------------------------"
+            echo "INFO - --------------------------- Starting S3 to Kubernetes Secrets Sync Process --------------------------"
+            echo "INFO - --------------------------- Starting S3 File Sync --------------------------"
 
             SYNC_SUCCESS=1  # Initialize sync success flag
 
             {{- range .Values.NiFiSync.syncPaths }}
             {{- if ne .pathType "fs" }}
-            echo "$(date) - INFO - Syncing Remote Path $instanceName/{{ .remotePath }} to /tmp/sync{{ .localPath }}"
+            echo "INFO - Syncing Remote Path $instanceName/{{ .remotePath }} to /tmp/sync{{ .localPath }}"
 
             if ! python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local /tmp/sync{{ .localPath }} --exclude .placeholder --overwrite; then
-              echo "$(date) - Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
+              echo "Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
               SYNC_SUCCESS=0  # Set sync success flag to 0 if any sync fails
             fi
             {{- end }}
             {{- end }}
 
-            echo "$(date) - INFO --------------------------- Completed S3 File Sync --------------------------"
+            echo "INFO - --------------------------- Completed S3 File Sync --------------------------"
 
             if [ "$SYNC_SUCCESS" -eq 1 ]; then
-              echo "$(date) - INFO --------------------------- Starting Kubernetes Secret Sync --------------------------"
+              echo "INFO - --------------------------- Starting Kubernetes Secret Sync --------------------------"
               sh /scripts/create-secrets-vault.sh
-              echo "$(date) - INFO --------------------------- Completed Kubernetes Secret Sync --------------------------"
+              echo "INFO - --------------------------- Completed Kubernetes Secret Sync --------------------------"
             else
-              echo "$(date) - INFO - Skipping Kubernetes Secret Sync due to S3 sync errors."
+              echo "INFO - Skipping Kubernetes Secret Sync due to S3 sync errors."
             fi
 
-            echo "$(date) - INFO --------------------------- Completed S3 to Kubernetes Secrets Sync Process --------------------------"
-            echo "$(date) - INFO - Next Sync: {{ .Values.NiFiSync.s3Sync.syncInterval }} "
+            echo "INFO - --------------------------- Completed S3 to Kubernetes Secrets Sync Process --------------------------"
+            echo "INFO - Next Sync: {{ .Values.NiFiSync.s3Sync.syncInterval }} "
             sleep {{ .Values.NiFiSync.s3Sync.syncInterval }}
           done
         volumeMounts:

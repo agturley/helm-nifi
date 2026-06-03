@@ -562,7 +562,7 @@ data:
 
   create-secrets-vault.sh: |
     #!/bin/bash
-    echo "$(date) - INFO - -------------------------- Starting Generic secret sync --------------------------"
+    echo "INFO - -------------------------- Starting Generic secret sync --------------------------"
 
     # Variables (populated via Helm)
     NAMESPACE="{{ $.Release.Namespace }}"
@@ -592,7 +592,7 @@ data:
     
     # Function to authenticate to Vault using Kubernetes service account token
     authenticate_with_vault() {
-      echo "$(date) - INFO - Authenticating with Vault using Kubernetes service account..."
+      echo "INFO - Authenticating with Vault using Kubernetes service account..."
 
       VAULT_TOKEN=$(curl -s --request POST \
         --header "X-Vault-Namespace: $VAULT_NAMESPACE" \
@@ -601,10 +601,10 @@ data:
         "$VAULT_ADDR/v1/auth/$VAULT_MOUNT/login" | jq -r '.auth.client_token')
     
       if [ "$VAULT_TOKEN" == "null" ] || [ -z "$VAULT_TOKEN" ]; then
-        echo "$(date) - ERROR - Vault authentication failed."
+        echo "ERROR - Vault authentication failed."
         exit 1
       else
-        echo "$(date) - INFO - Successfully authenticated with Vault."
+        echo "INFO - Successfully authenticated with Vault."
       fi
     }
     
@@ -619,7 +619,7 @@ data:
 
       # If no local cache file, attempt to retrieve existing secret from K8s or Vault
       if [ ! -f "$local_data_file" ]; then
-        echo "$(date) - INFO - No local data cache found for $secret_name. Checking Kubernetes for existing secret..." >&2
+        echo "INFO - No local data cache found for $secret_name. Checking Kubernetes for existing secret..." >&2
       
         # Try to pull the existing secret from Kubernetes
         existing_secret=$(curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" -X GET \
@@ -630,12 +630,12 @@ data:
           
     
         if [ "$existing_secret" == "200" ]; then
-          echo "$(date) - INFO - Existing secret found in Kubernetes for $secret_name. Saving to local file..." >&2
+          echo "INFO - Existing secret found in Kubernetes for $secret_name. Saving to local file..." >&2
          
           #####VAULT READ
           if [ "$secret_type" == "vault" ]; then
             # If stored in Vault
-            echo "$(date) - INFO - Reading $secret_name from Vault and saving to local file..." >&2
+            echo "INFO - Reading $secret_name from Vault and saving to local file..." >&2
             cresponse=$(curl -s -X GET \
               --header "X-Vault-Token: $VAULT_TOKEN" \
               --cacert <(echo "$KUBE_CA_PATH") \
@@ -648,7 +648,7 @@ data:
 
           else
             # If stored in Kubernetes
-            echo "$(date) - INFO - Reading $secret_name from Kubernetes and saving to local file..." >&2
+            echo "INFO - Reading $secret_name from Kubernetes and saving to local file..." >&2
             cresponse=$(curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -X GET \
               -H "Authorization: Bearer $TOKEN" \
               -H "Accept: application/json" \
@@ -657,12 +657,12 @@ data:
             echo $kubernetes_data > $local_data_file
           fi
         else
-          echo "$(date) - INFO - No existing secret found in Kubernetes for $secret_name. Creating a new one..." >&2
+          echo "INFO - No existing secret found in Kubernetes for $secret_name. Creating a new one..." >&2
           sync_task="new"
         fi
       else
         # local data exists
-        echo "$(date) - INFO - Local data cache found for $secret_name." >&2
+        echo "INFO - Local data cache found for $secret_name." >&2
         kubernetes_data=$(cat "$local_data_file")
       fi
       
@@ -678,7 +678,7 @@ data:
       #echo $local_data >&2
       #echo =============k8s-data------------------ >&2
       if [ "$kubernetes_data" == "$local_data" ]; then
-        echo "$(date) - INFO - The existing local data for $secret_name matches the new data. No update needed." >&2
+        echo "INFO - The existing local data for $secret_name matches the new data. No update needed." >&2
         sync_task="match"
         printf "match"
       else
@@ -703,7 +703,7 @@ data:
       local secret_pathtype="$5"
     
       if [ "$sync_type" == "new" ] || [ "$sync_type" == "update" ]; then
-        echo "$(date) - INFO - Writing secret: $secret_name to Vault..." >&2
+        echo "INFO - Writing secret: $secret_name to Vault..." >&2
     
         # Decode the base64 so Vault gets raw file contents
         decoded_data=$(echo "$secret_data" | jq '.data |= with_entries(.value |= @base64d)')
@@ -721,10 +721,10 @@ data:
         )
     
         if [ "$http_status" -eq 200 ] || [ "$http_status" -eq 204 ]; then
-          echo "$(date) - INFO - Successfully wrote secret: $secret_name to Vault" >&2
+          echo "INFO - Successfully wrote secret: $secret_name to Vault" >&2
           create_vault_kubernetes_secrets "$secret_name" "$sync_type" "$local_data_file" "$secret_pathtype"
         else
-          echo "$(date) - ERROR - Failed to write secret: $secret_name to Vault" >&2
+          echo "ERROR - Failed to write secret: $secret_name to Vault" >&2
           echo $http_status
         fi
       fi
@@ -740,7 +740,7 @@ data:
       local secret_pathtype="$4"
     
       if [ "$sync_type" == "new" ]; then
-        echo "$(date) - INFO - Creating new VaultStaticSecret $secret_name in Kubernetes..."
+        echo "INFO - Creating new VaultStaticSecret $secret_name in Kubernetes..."
         VAULT_STATIC_SECRET='{
           "apiVersion": "secrets.hashicorp.com/v1beta1",
           "kind": "VaultStaticSecret",
@@ -767,13 +767,13 @@ data:
           -d "$VAULT_STATIC_SECRET" \
           "$KUBERNETES_API_SERVER/apis/secrets.hashicorp.com/v1beta1/namespaces/$NAMESPACE/vaultstaticsecrets")
         if [ "$cresponse" == "201" ]; then
-          echo "$(date) - INFO - Successfully created new secret: $secret_name"
+          echo "INFO - Successfully created new secret: $secret_name"
         else
-          echo "$(date) - ERROR - Failed to create secret: $secret_name"
-          echo "$(date) - ERROR - Failure Response: $cresponse"
+          echo "ERROR - Failed to create secret: $secret_name"
+          echo "ERROR - Failure Response: $cresponse"
         fi
       elif [ "$sync_type" == "update" ]; then
-        echo "$(date) - INFO - Updating existing VaultStaticSecret $secret_name in Kubernetes..."
+        echo "INFO - Updating existing VaultStaticSecret $secret_name in Kubernetes..."
         VAULT_STATIC_SECRET='{
           "apiVersion": "secrets.hashicorp.com/v1beta1",
           "kind": "VaultStaticSecret",
@@ -803,16 +803,16 @@ data:
           -d "$VAULT_STATIC_SECRET" \
           "$KUBERNETES_API_SERVER/apis/secrets.hashicorp.com/v1beta1/namespaces/$NAMESPACE/vaultstaticsecrets/$secret_name")
         if [ "$cresponse" == "200" ]; then
-          echo "$(date) - INFO - Successfully updated VaultStaticSecret: $secret_name"
+          echo "INFO - Successfully updated VaultStaticSecret: $secret_name"
         else
-          echo "$(date) - ERROR - Failed to update VaultStaticSecret: $secret_name"
+          echo "ERROR - Failed to update VaultStaticSecret: $secret_name"
         fi
       fi
     
       # Add secret name to the added/updated secrets array
       ADDED_SECRETS+=("$secret_name")
       # Update the local data file with the new data
-      echo "$(date) - INFO - Updating local data cache for $secret_name"
+      echo "INFO - Updating local data cache for $secret_name"
       cleaned_data=$(echo "$data" | jq -c '.data')
       echo "$cleaned_data" > "$local_data_file" 
     }
@@ -826,7 +826,7 @@ data:
       local sync_type="$4"
     
       if [ "$sync_type" == "new" ]; then
-        echo "$(date) - INFO - Creating new secret $secret_name in Kubernetes..."
+        echo "INFO - Creating new secret $secret_name in Kubernetes..."
         cresponse=$(
           echo "$data" | \
           curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" \
@@ -837,14 +837,14 @@ data:
             "$KUBERNETES_API_SERVER/api/v1/namespaces/$NAMESPACE/secrets"
         )
         if [ "$cresponse" == "201" ]; then
-          echo "$(date) - INFO - Successfully created new secret: $secret_name"
+          echo "INFO - Successfully created new secret: $secret_name"
           ADDED_SECRETS+=("$secret_name")
         else
-          echo "$(date) - ERROR - Failed to create secret: $secret_name"
-          echo "$(date) - ERROR - Failure Response: $cresponse"          
+          echo "ERROR - Failed to create secret: $secret_name"
+          echo "ERROR - Failure Response: $cresponse"          
         fi
       elif [ "$sync_type" == "update" ]; then
-        echo "$(date) - INFO - Updating existing secret $secret_name in Kubernetes..."
+        echo "INFO - Updating existing secret $secret_name in Kubernetes..."
         cresponse=$(
           echo "$data" | \
           curl --cacert /run/secrets/kubernetes.io/serviceaccount/ca.crt -s -o /dev/null -w "%{http_code}" \
@@ -855,18 +855,18 @@ data:
             "$KUBERNETES_API_SERVER/api/v1/namespaces/$NAMESPACE/secrets/$secret_name"
         )
         if [ "$cresponse" == "200" ]; then
-          echo "$(date) - INFO - Successfully updated secret: $secret_name"
+          echo "INFO - Successfully updated secret: $secret_name"
           # Add secret name to the added/updated secrets array
           ADDED_SECRETS+=("$secret_name")
         else
-          echo "$(date) - ERROR - Failed to update secret: $secret_name"
+          echo "ERROR - Failed to update secret: $secret_name"
         fi
       fi
     
       # Update local data file
       cleaned_data=$(echo "$data" | jq -c '.data')
       echo "$cleaned_data" > "$local_data_file"
-      echo "$(date) - INFO - Local data cache for $secret_name updated."
+      echo "INFO - Local data cache for $secret_name updated."
     }
     
     # Create local data dir
@@ -899,7 +899,7 @@ data:
         # GENERIC SECRET (Opaque)
         ##########################################################
         secret_pathtype="Opaque"
-        echo "$(date) - INFO - Processing Opaque Secret: $SECRET_NAME"
+        echo "INFO - Processing Opaque Secret: $SECRET_NAME"
     
         # Use temp files instead of big shell variables
         data_tmp_file=$(mktemp)
@@ -939,17 +939,17 @@ data:
         # Add to found secrets
         FOUND_SECRETS+=("$SECRET_NAME")
     
-        echo "$(date) - INFO - Starting Check Certs for Opaque Secret"
+        echo "INFO - Starting Check Certs for Opaque Secret"
         sync_task=$(check_certs "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$SECRET_TYPE")
-        echo "$(date) - INFO - ===================================="
-        echo "$(date) - INFO - Secret Name: $SECRET_NAME"
-        echo "$(date) - INFO - Sync Task: $sync_task"
-        echo "$(date) - INFO - Secret Type: $secret_pathtype"
-        echo "$(date) - INFO - Destination: $SECRET_TYPE"
-        echo "$(date) - INFO - ===================================="
+        echo "INFO - ===================================="
+        echo "INFO - Secret Name: $SECRET_NAME"
+        echo "INFO - Sync Task: $sync_task"
+        echo "INFO - Secret Type: $secret_pathtype"
+        echo "INFO - Destination: $SECRET_TYPE"
+        echo "INFO - ===================================="
     
         if [ "$sync_task" == "new" ] || [ "$sync_task" == "update" ]; then
-          echo "$(date) - INFO - Modifying Opaque Secret: $SECRET_NAME"
+          echo "INFO - Modifying Opaque Secret: $SECRET_NAME"
           # Write the secret based on secretType
           {{- if eq $secretType "kubernetes" }}
             write_to_kubernetes "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$sync_task" 
@@ -958,8 +958,8 @@ data:
           {{- else }}
             {{- fail "Invalid secretType '{{ $secretType }}' for syncPath '{{ $syncPath.pathName }}'. Allowed values are 'kubernetes' or 'vault'." }}
           {{- end }}
-          echo "$(date) - INFO - Completed Processing Opaque Secret: $SECRET_NAME"
-          echo "$(date) - INFO - ===================================="
+          echo "INFO - Completed Processing Opaque Secret: $SECRET_NAME"
+          echo "INFO - ===================================="
         fi
       {{- else if eq $pathType "tls-secret" }}
         ##########################################################
@@ -967,16 +967,17 @@ data:
         ##########################################################
         secret_pathtype="kubernetes.io/tls"
         # Process TLS Secret
-        echo "$(date) - INFO - Processing TLS Secret: $SECRET_NAME"
+        echo "INFO - Processing TLS Secret: $SECRET_NAME"
 
         # Files expected: tls.crt and tls.key
         crt_file="$FOLDER_PATH/tls.crt"
         key_file="$FOLDER_PATH/tls.key"
 
         if [[ ! -f "$crt_file" ]] || [[ ! -f "$key_file" ]]; then
-          echo "$(date) - ERROR - Both tls.crt and tls.key must be present in $FOLDER_PATH" >&2
-          continue
-        fi
+          # These per-path blocks are unrolled by a Helm range (not a shell
+          # loop), so `continue` has no loop to skip; gate with else instead.
+          echo "WARNING - tls.crt and/or tls.key not present in $FOLDER_PATH; skipping TLS secret $SECRET_NAME"
+        else
 
         # Encode the files
         crt_content="$(encode_file "$crt_file")"
@@ -1005,16 +1006,16 @@ data:
         datapayload=$(jq '{data: .}' < "$tls_tmp_file")
     
         FOUND_SECRETS+=("$SECRET_NAME")
-        echo "$(date) - INFO - Starting Check Certs for TLS Secret"
+        echo "INFO - Starting Check Certs for TLS Secret"
         sync_task=$(check_certs "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$SECRET_TYPE")
-        echo "$(date) - INFO - ===================================="
-        echo "$(date) - INFO - Secret Name: $SECRET_NAME"
-        echo "$(date) - INFO - Sync Task: $sync_task"
-        echo "$(date) - INFO - Secret Type: $secret_pathtype"
-        echo "$(date) - INFO - Destination: $SECRET_TYPE"
-        echo "$(date) - INFO - ===================================="
+        echo "INFO - ===================================="
+        echo "INFO - Secret Name: $SECRET_NAME"
+        echo "INFO - Sync Task: $sync_task"
+        echo "INFO - Secret Type: $secret_pathtype"
+        echo "INFO - Destination: $SECRET_TYPE"
+        echo "INFO - ===================================="
         if [ "$sync_task" == "new" ] || [ "$sync_task" == "update" ]; then
-          echo "$(date) - INFO - Modifying TLS Secret: $SECRET_NAME"
+          echo "INFO - Modifying TLS Secret: $SECRET_NAME"
           # Write the secret based on secretType
           {{- if eq $secretType "kubernetes" }}
             write_to_kubernetes "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$sync_task" 
@@ -1023,9 +1024,10 @@ data:
           {{- else }}
             {{- fail "Invalid secretType '{{ $secretType }}' for syncPath '{{ $syncPath.pathName }}'. Allowed values are 'kubernetes' or 'vault'." }}
           {{- end }}
-          echo "$(date) - INFO - Completed Processing TLS Secret: $SECRET_NAME"
-          echo "$(date) - INFO - ===================================="
+          echo "INFO - Completed Processing TLS Secret: $SECRET_NAME"
+          echo "INFO - ===================================="
         fi
+        fi  # end tls.crt/tls.key presence guard
 
 
       {{- else if eq $pathType "ca-secret" }}
@@ -1033,7 +1035,7 @@ data:
         # CA SECRET (Opaque)
         ##########################################################
         secret_pathtype="Opaque"
-        echo "$(date) - INFO - Processing CA Secret: $SECRET_NAME"
+        echo "INFO - Processing CA Secret: $SECRET_NAME"
         
         # Build CA cert data via tmpfile
         ca_tmp_file=$(mktemp)
@@ -1052,7 +1054,7 @@ data:
               > "$ca_tmp_file.new"
             mv "$ca_tmp_file.new" "$ca_tmp_file"
           else
-            echo "$(date) - INFO - $cert_file is not a regular file. Skipping..."
+            echo "INFO - $cert_file is not a regular file. Skipping..."
           fi
         done
     
@@ -1072,17 +1074,17 @@ data:
         datapayload=$(jq '{data: .}' < "$ca_tmp_file")
         # Add secret name to the found secrets array
         FOUND_SECRETS+=("$SECRET_NAME")
-        echo "$(date) - INFO - Starting Check Certs for CA Secret"
+        echo "INFO - Starting Check Certs for CA Secret"
         sync_task=$(check_certs "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$SECRET_TYPE")
-        echo "$(date) - INFO - ===================================="
-        echo "$(date) - INFO - Secret Name: $SECRET_NAME"
-        echo "$(date) - INFO - Sync Task: $sync_task"
-        echo "$(date) - INFO - Secret Type: $secret_pathtype"
-        echo "$(date) - INFO - Destination: $SECRET_TYPE"
-        echo "$(date) - INFO - ===================================="
+        echo "INFO - ===================================="
+        echo "INFO - Secret Name: $SECRET_NAME"
+        echo "INFO - Sync Task: $sync_task"
+        echo "INFO - Secret Type: $secret_pathtype"
+        echo "INFO - Destination: $SECRET_TYPE"
+        echo "INFO - ===================================="
 
         if [ "$sync_task" == "new" ] || [ "$sync_task" == "update" ]; then
-          echo "$(date) - INFO - Modifying CA Secret: $SECRET_NAME"
+          echo "INFO - Modifying CA Secret: $SECRET_NAME"
           # Write the secret based on secretType
           {{- if eq $secretType "kubernetes" }}
             write_to_kubernetes "$SECRET_NAME" "$data" "$LOCAL_DATA_FILE" "$sync_task"
@@ -1091,8 +1093,8 @@ data:
           {{- else }}
             {{- fail "Invalid secretType '{{ $secretType }}' for syncPath '{{ $syncPath.pathName }}'. Allowed values are 'kubernetes' or 'vault'." }}
           {{- end }}
-          echo "$(date) - INFO - Completed Processing CA Secret: $SECRET_NAME"
-          echo "$(date) - INFO - ===================================="
+          echo "INFO - Completed Processing CA Secret: $SECRET_NAME"
+          echo "INFO - ===================================="
         fi
 
       {{- end }}
@@ -1100,9 +1102,9 @@ data:
     {{- end }}
 
     # Output the list of found and added/updated secrets
-    echo "$(date) - INFO - Found secrets: ${FOUND_SECRETS[*]}"
-    echo "$(date) - INFO - Added/Updated secrets: ${ADDED_SECRETS[*]}"
-    echo "$(date) - INFO - -------------------------- Completed Secret Sync --------------------------"
+    echo "INFO - Found secrets: ${FOUND_SECRETS[*]}"
+    echo "INFO - Added/Updated secrets: ${ADDED_SECRETS[*]}"
+    echo "INFO - -------------------------- Completed Secret Sync --------------------------"
 {{- if .Values.NiFiSync.s3Sync.enabled }}
 
   s3sync.py: |
@@ -1161,9 +1163,10 @@ data:
     TRANSFER = TransferConfig(use_threads=False)
 
 
-    def log(msg):
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print("%s - %s" % (stamp, msg), flush=True)
+    def log(msg, level="INFO"):
+        # The sidecar's stream wrapper prepends the ISO-8601 timestamp and " - "
+        # separator; we add the level so lines read "<ts> - LEVEL - message".
+        print("%s - %s" % (level, msg), flush=True)
 
 
     def env_bool(name, default=False):
@@ -1183,7 +1186,7 @@ data:
     def bucket_name():
         bkt = os.environ.get("S3_BUCKET")
         if not bkt:
-            log("ERROR - S3_BUCKET is not set")
+            log("S3_BUCKET is not set", "ERROR")
             sys.exit(1)
         return bkt
 
@@ -1192,7 +1195,7 @@ data:
         return (prefix or "").strip("/")
 
 
-    def make_client():
+    def make_client(announce=False):
         endpoint = os.environ.get("S3_ENDPOINT") or None
         region = (
             os.environ.get("AWS_DEFAULT_REGION")
@@ -1240,9 +1243,10 @@ data:
             else:
                 auth_mode = "default chain (no static keys)"
                 log(
-                    "WARNING - USE_IRSA is false but S3_ACCESS_KEY_ID / "
+                    "USE_IRSA is false but S3_ACCESS_KEY_ID / "
                     "S3_SECRET_ACCESS_KEY are unset; falling back to the "
-                    "default credential chain"
+                    "default credential chain",
+                    "WARNING",
                 )
         if insecure:
             try:
@@ -1252,21 +1256,24 @@ data:
             except Exception:
                 pass
 
-        log(
-            "Backend: boto3 %s (botocore %s), python %s | endpoint=%s | "
-            "region=%s | addressing=%s | tls_verify=%s | auth=%s | "
-            "transfers=single-threaded, connect_timeout=10s, read_timeout=60s"
-            % (
-                boto3.__version__,
-                botocore.__version__,
-                platform.python_version(),
-                endpoint or "(default AWS S3)",
-                region,
-                s3_opts.get("addressing_style", "auto (virtual-hosted)"),
-                not insecure,
-                auth_mode,
+        # Print the backend/auth summary once at startup (the wait-ready call),
+        # not on every subcommand invocation.
+        if announce:
+            log(
+                "Backend: boto3 %s (botocore %s), python %s | endpoint=%s | "
+                "region=%s | addressing=%s | tls_verify=%s | auth=%s | "
+                "transfers=single-threaded, connect_timeout=10s, read_timeout=60s"
+                % (
+                    boto3.__version__,
+                    botocore.__version__,
+                    platform.python_version(),
+                    endpoint or "(default AWS S3)",
+                    region,
+                    s3_opts.get("addressing_style", "auto (virtual-hosted)"),
+                    not insecure,
+                    auth_mode,
+                )
             )
-        )
         return boto3.client("s3", **kwargs)
 
 
@@ -1315,7 +1322,8 @@ data:
             except (ClientError, BotoCoreError) as exc:
                 log(
                     "Unable to reach S3 bucket '%s' (%s). Retrying in %ds..."
-                    % (bucket, exc, interval)
+                    % (bucket, exc, interval),
+                    "WARNING",
                 )
                 time.sleep(interval)
 
@@ -1341,13 +1349,20 @@ data:
         local = args.local
         os.makedirs(local, exist_ok=True)
         count = 0
+        remote_rel = set()   # relative paths present in S3 (download candidates)
+        remote_total = 0     # all objects under the prefix, incl. excluded ones
+        # NOTE: if listing/downloading raises (S3 unreachable, auth failure),
+        # the exception propagates and we never reach the prune step below, so
+        # local files are left untouched.
         for obj in iter_objects(client, bucket, prefix + "/"):
             key = obj["Key"]
             rel = key[len(prefix):].lstrip("/")
             if not rel or key.endswith("/"):
                 continue
+            remote_total += 1
             if args.exclude and os.path.basename(key) == args.exclude:
                 continue
+            remote_rel.add(rel)
             dest = os.path.join(local, rel)
             if not args.overwrite and os.path.exists(dest):
                 if os.path.getsize(dest) == obj.get("Size", -1):
@@ -1356,8 +1371,51 @@ data:
             log("  downloading s3://%s/%s (%s bytes)" % (bucket, key, obj.get("Size", "?")))
             client.download_file(bucket, key, dest, Config=TRANSFER)
             count += 1
-        log("mirror-down s3://%s/%s -> %s (%d object(s))" % (bucket, prefix, local, count))
+        if count:
+            log("Downloaded %d file(s) from s3://%s/%s to %s" % (count, bucket, prefix, local))
+        else:
+            log("Up to date: no files to download from s3://%s/%s" % (bucket, prefix))
+        if args.delete:
+            _prune_local_orphans(local, prefix, bucket, remote_rel, remote_total, args.exclude)
         return 0
+
+
+    def _prune_local_orphans(local, prefix, bucket, remote_rel, remote_total, exclude):
+        """Delete local files under *local* that are not present in S3.
+
+        Only runs after a fully successful listing (see cmd_mirror_down). As an
+        extra guard, refuses to prune when the remote prefix returned zero
+        objects — that usually means a misconfigured bucket/prefix (or an
+        unreachable endpoint that still answered) rather than a real empty
+        state, since the bootstrap always leaves a .placeholder object.
+        """
+        if remote_total == 0:
+            log(
+                "delete-orphans: remote prefix s3://%s/%s returned no objects; "
+                "skipping local prune to avoid wiping %s" % (bucket, prefix, local),
+                "WARNING",
+            )
+            return
+        removed = 0
+        for root, dirs, files in os.walk(local, topdown=False):
+            for name in files:
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, local).replace(os.sep, "/")
+                if rel in remote_rel or name == exclude:
+                    continue
+                os.remove(full)
+                log("  removed local orphan %s (not in S3)" % full)
+                removed += 1
+            # Clean up directories left empty by the prune (never the root).
+            if root != local:
+                try:
+                    os.rmdir(root)
+                except OSError:
+                    pass
+        if removed:
+            log("Removed %d local file(s) not present in s3://%s/%s" % (removed, bucket, prefix))
+        else:
+            log("No local orphans to remove for %s" % local)
 
 
     def cmd_mirror_up(client, args):
@@ -1376,7 +1434,10 @@ data:
                 log("  uploading %s -> s3://%s/%s" % (full, bucket, key))
                 client.upload_file(full, bucket, key, Config=TRANSFER)
                 count += 1
-        log("mirror-up %s -> s3://%s/%s (%d object(s))" % (local, bucket, prefix, count))
+        if count:
+            log("Uploaded %d file(s) from %s to s3://%s/%s" % (count, local, bucket, prefix))
+        else:
+            log("Nothing to upload from %s" % local)
         return 0
 
 
@@ -1413,7 +1474,7 @@ data:
         instance = os.environ.get("instanceName")
         pod = os.environ.get("POD_NAME")
         if not instance or not pod:
-            log("ERROR - instanceName and POD_NAME are required for flow-backup")
+            log("instanceName and POD_NAME are required for flow-backup", "ERROR")
             return 1
 
         flow_path = os.environ.get("FLOW_PATH", "/opt/nifi/data/flow.json.gz")
@@ -1441,7 +1502,7 @@ data:
                             CopySource={"Bucket": bucket, "Key": remote_current},
                         )
                     except ClientError as exc:
-                        log("Warning: failed to archive old flow.json.gz (%s). Continuing." % exc)
+                        log("failed to archive old flow.json.gz (%s). Continuing." % exc, "WARNING")
                 else:
                     log("No previous remote flow.json.gz found; this will be the first backup.")
                 log("Uploading updated flow.json.gz to %s" % remote_current)
@@ -1455,7 +1516,7 @@ data:
                     )
                     log("Uploaded flow.json.gz (sha256 recorded in object metadata).")
                 except (ClientError, BotoCoreError) as exc:
-                    log("Warning: Failed to upload updated flow.json.gz (%s)" % exc)
+                    log("Failed to upload updated flow.json.gz (%s)" % exc, "WARNING")
         else:
             log("flow.json.gz not found at %s. Skipping flow upload." % flow_path)
 
@@ -1468,7 +1529,7 @@ data:
             try:
                 cmd_mirror_up(client, mirror_args)
             except (ClientError, BotoCoreError) as exc:
-                log("Warning: Archive sync failed (%s)" % exc)
+                log("Archive sync failed (%s)" % exc, "WARNING")
         else:
             log("Archive path %s not found. Skipping archive sync." % archive_path)
 
@@ -1554,6 +1615,12 @@ data:
         p_down.add_argument("--local", required=True)
         p_down.add_argument("--exclude", default=None)
         p_down.add_argument("--overwrite", action="store_true")
+        p_down.add_argument(
+            "--delete",
+            action="store_true",
+            help="remove local files not present in S3 (skipped if the remote "
+                 "prefix is empty or unreachable)",
+        )
         p_down.set_defaults(func=cmd_mirror_down)
 
         p_up = sub.add_parser("mirror-up")
@@ -1568,11 +1635,12 @@ data:
 
     def main():
         args = build_parser().parse_args()
-        client = make_client()
+        # Announce the backend once, on the startup wait-ready call.
+        client = make_client(announce=(args.command == "wait-ready"))
         try:
             sys.exit(args.func(client, args))
         except (ClientError, BotoCoreError) as exc:
-            log("ERROR - %s failed: %s" % (args.command, exc))
+            log("%s failed: %s" % (args.command, exc), "ERROR")
             sys.exit(1)
 
 

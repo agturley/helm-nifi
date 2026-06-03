@@ -77,6 +77,17 @@
         args:
         - |
           #!/bin/sh
+          # --- Prefix every stdout/stderr line with an ISO-8601 UTC timestamp ---
+          # Routes all output (including raw stderr from sub-tools and python)
+          # through one timestamper so every log line is machine-parseable.
+          if _ts_fifo="$(mktemp -u /tmp/ts.XXXXXX)" && mkfifo "$_ts_fifo" 2>/dev/null; then
+            while IFS= read -r _ts_line; do
+              printf '%s - %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_ts_line"
+            done < "$_ts_fifo" &
+            exec > "$_ts_fifo" 2>&1
+            rm -f "$_ts_fifo"
+          fi
+          # --- end timestamp wrapper ---
 {{- /* START Wait for vault sidecar HTTP readiness on /ready (tries curl, wget, nc, falls back to port check) */ -}}
 {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           wait_for_sidecar_http_ready() {
@@ -181,20 +192,20 @@
           # ---------------- Initial FS Sync Bootstrapping ----------------
           {{- range .Values.NiFiSync.syncPaths }}
           {{- if eq .pathType "fs" }}
-          echo "$(date) - Sync File System Paths with S3. LocalPath: {{ .localPath }} RemotePath: $S3_BUCKET/$instanceName/{{ .remotePath }}"
+          echo "Sync File System Paths with S3. LocalPath: {{ .localPath }} RemotePath: $S3_BUCKET/$instanceName/{{ .remotePath }}"
 
           if [ ! -d "{{ .localPath }}" ]; then
-            echo "$(date) - Creating Local Path: {{ .localPath }}"
+            echo "Creating Local Path: {{ .localPath }}"
             mkdir -p {{ .localPath }}
           fi
 
           if ! python3 "$S3SYNC" prefix-exists --remote "$instanceName/{{ .remotePath }}"; then
-            echo "$(date) - Creating Remote Path $instanceName/{{ .remotePath }} in S3"
+            echo "Creating Remote Path $instanceName/{{ .remotePath }} in S3"
             python3 "$S3SYNC" put-placeholder --remote "$instanceName/{{ .remotePath }}"
 
             if [ "$(ls -A {{ .localPath }})" ]; then
-              echo "$(date) - Syncing local data: {{ .localPath }} to S3: $instanceName/{{ .remotePath }}"
-              python3 "$S3SYNC" mirror-up --local {{ .localPath }} --remote "$instanceName/{{ .remotePath }}" --overwrite || echo "$(date) - Warning: Initial sync failed for {{ .localPath }}"
+              echo "Syncing local data: {{ .localPath }} to S3: $instanceName/{{ .remotePath }}"
+              python3 "$S3SYNC" mirror-up --local {{ .localPath }} --remote "$instanceName/{{ .remotePath }}" --overwrite || echo "Warning: Initial sync failed for {{ .localPath }}"
             fi
           fi
           {{- end }}
@@ -205,9 +216,9 @@
           {{- if .Values.NiFiSync.s3Sync.flowBackup.enabled }}
           (
             while true; do
-              echo "$(date) - Starting flow backup loop"
-              python3 "$S3SYNC" flow-backup || echo "$(date) - Warning: flow backup failed"
-              echo "$(date) - Flow backup complete. Sleeping for {{ .Values.NiFiSync.s3Sync.flowBackup.interval }}."
+              echo "Starting flow backup loop"
+              python3 "$S3SYNC" flow-backup || echo "Warning: flow backup failed"
+              echo "Flow backup complete. Sleeping for {{ .Values.NiFiSync.s3Sync.flowBackup.interval }}."
               sleep {{ .Values.NiFiSync.s3Sync.flowBackup.interval }}
             done
           ) &
@@ -217,14 +228,14 @@
           # ---------------- Start FS Sync Loop ----------------
           (
             while true; do
-              echo "$(date) - Starting file system sync loop"
+              echo "Starting file system sync loop"
               {{- range .Values.NiFiSync.syncPaths }}
               {{- if eq .pathType "fs" }}
-              echo "$(date) - Syncing Remote Path $instanceName/{{ .remotePath }} to {{ .localPath }}"
-              python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local {{ .localPath }} --exclude .placeholder --overwrite || echo "$(date) - Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
+              echo "Syncing Remote Path $instanceName/{{ .remotePath }} to {{ .localPath }}"
+              python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local {{ .localPath }} --exclude .placeholder --overwrite{{ if .deleteOrphans }} --delete{{ end }} || echo "Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
               {{- end }}
               {{- end }}
-              echo "$(date) - File sync completed. Sleeping for {{ .Values.NiFiSync.s3Sync.syncInterval }}."
+              echo "File sync completed. Sleeping for {{ .Values.NiFiSync.s3Sync.syncInterval }}."
               sleep {{ .Values.NiFiSync.s3Sync.syncInterval }}
             done
           ) &
