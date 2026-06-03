@@ -168,6 +168,12 @@ spec:
           value: {{ .Values.NiFiSync.s3Sync.endpoint }}
         - name: instanceName
           value: {{ template "apache-nifi.fullname" $ }}
+        - name: USE_IRSA
+          value: {{ .Values.NiFiSync.s3Sync.useIRSA | quote }}
+        - name: S3_INSECURE
+          value: {{ .Values.NiFiSync.s3Sync.insecure | quote }}
+        - name: AWS_DEFAULT_REGION
+          value: {{ .Values.NiFiSync.s3Sync.region | quote }}
         command: ["/bin/sh", "-c"]
         args:
         - |
@@ -269,29 +275,22 @@ spec:
           {{- end }}
           {{- end }}
 {{- end }}
-          # Function to set up mc alias with retries
-          setup_mc_alias() {
-            {{- if and (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") (ne "" (default "" .Values.properties.secretsFilePath)) }}
-            _sp={{ .Values.properties.secretsFilePath | quote }}
-            until mc alias set s3 "$S3_ENDPOINT" \
-              "$(tr -d '\r\n' < "$_sp/S3_ACCESS_KEY_ID")" \
-              "$(tr -d '\r\n' < "$_sp/S3_SECRET_ACCESS_KEY")" \
-              --insecure; do
-              echo "$(date) - Unable to set mc alias. S3 might be unavailable. Retrying in 30 seconds..."
-              sleep 30
-            done
-            {{- else }}
-            until mc alias set s3 $S3_ENDPOINT $S3_ACCESS_KEY_ID $S3_SECRET_ACCESS_KEY --insecure; do
-              echo "$(date) - Unable to set mc alias. S3 might be unavailable. Retrying in 30 seconds..."
-              sleep 30
-            done
-            {{- end }}
-          }
+          # s3sync.py replaces the MinIO `mc` client; credentials resolve via the
+          # boto3 default chain (IRSA) or S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY.
+          S3SYNC=/scripts/s3sync.py
+          export S3_BUCKET S3_ENDPOINT instanceName
+          {{- if and (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") (ne "" (default "" .Values.properties.secretsFilePath)) }}
+          # Load S3 credentials from the secrets file directory (non-IRSA)
+          _sp={{ .Values.properties.secretsFilePath | quote }}
+          export S3_ACCESS_KEY_ID="$(tr -d '\r\n' < "$_sp/S3_ACCESS_KEY_ID" 2>/dev/null)"
+          export S3_SECRET_ACCESS_KEY="$(tr -d '\r\n' < "$_sp/S3_SECRET_ACCESS_KEY" 2>/dev/null)"
+          unset _sp
+          {{- end }}
 
-          # Call the setup_mc_alias function
-          setup_mc_alias
+          # Block until the S3 bucket is reachable (replaces mc alias retry loop)
+          python3 "$S3SYNC" wait-ready
 
-          # Initial synchronization logic
+          # Initial synchronization logic: ensure remote prefixes exist
           {{- range .Values.NiFiSync.syncPaths }}
           # Sync Secrets
           {{- if ne .pathType "fs" }}
@@ -302,11 +301,9 @@ spec:
           fi
 
           # Check if remote path exists in S3, if not, create it by uploading an empty placeholder
-          echo "Creating remote S3 folders"
-
-          if ! mc --insecure ls s3/$S3_BUCKET/$instanceName/{{ .remotePath }} 2> /dev/null | grep -q "^"; then
+          if ! python3 "$S3SYNC" prefix-exists --remote "$instanceName/{{ .remotePath }}"; then
             echo "$(date) - INFO - Creating Remote Path $instanceName/{{ .remotePath }} in S3"
-            echo "placeholder" | mc --insecure pipe s3/$S3_BUCKET/$instanceName/{{ .remotePath }}/.placeholder
+            python3 "$S3SYNC" put-placeholder --remote "$instanceName/{{ .remotePath }}"
           fi
           {{- end }}
           # END Sync Secrets
@@ -314,14 +311,14 @@ spec:
           while true; do
             echo "$(date) - INFO --------------------------- Starting S3 to Kubernetes Secrets Sync Process --------------------------"
             echo "$(date) - INFO --------------------------- Starting S3 File Sync --------------------------"
-      
+
             SYNC_SUCCESS=1  # Initialize sync success flag
 
             {{- range .Values.NiFiSync.syncPaths }}
             {{- if ne .pathType "fs" }}
             echo "$(date) - INFO - Syncing Remote Path $instanceName/{{ .remotePath }} to /tmp/sync{{ .localPath }}"
 
-            if ! mc mirror --quiet --insecure --exclude ".placeholder" --overwrite s3/$S3_BUCKET/$instanceName/{{ .remotePath }} /tmp/sync{{ .localPath }}; then
+            if ! python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local /tmp/sync{{ .localPath }} --exclude .placeholder --overwrite; then
               echo "$(date) - Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
               SYNC_SUCCESS=0  # Set sync success flag to 0 if any sync fails
             fi
@@ -355,9 +352,7 @@ spec:
         - mountPath: /run/secrets/kubernetes.io/default-token
           name: default-token   
         - mountPath: /run/secrets/kubernetes.io/secret-modifier-token
-          name: secret-modifier-token   
-        - mountPath: /.mc
-          name: s3config
+          name: secret-modifier-token
         - mountPath: /scripts
           name: nifisync-scripts
       volumes:
@@ -375,8 +370,6 @@ spec:
           defaultMode: 0440              
       {{- end }}
       #END VaultSecretVolumes
-      - name: s3config
-        emptyDir: {}
 {{- if .Values.NiFiSync.s3Sync.enabled}}
       - name: nifisync-scripts
         configMap:

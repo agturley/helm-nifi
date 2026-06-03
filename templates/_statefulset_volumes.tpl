@@ -5,8 +5,6 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
 
 {{- define "nifi.statefulset.volumes" }}
       volumes:
-      - name: s3config
-        emptyDir: {}
 
     #VaultSecretVolumes
       {{- $vals := .Values.VaultNiFiSecrets }}

@@ -374,8 +374,6 @@
           - mountPath: /opt/nifi/nifi-sync/scripts
             name: nifisync-scripts
     {{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}
-          - mountPath: /.mc
-            name: s3config 
           - name: "tls"
             mountPath: /opt/nifi/nifi-current/tls
           - name: secret-reader-token

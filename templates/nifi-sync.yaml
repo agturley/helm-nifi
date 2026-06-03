@@ -1103,6 +1103,482 @@ data:
     echo "$(date) - INFO - Found secrets: ${FOUND_SECRETS[*]}"
     echo "$(date) - INFO - Added/Updated secrets: ${ADDED_SECRETS[*]}"
     echo "$(date) - INFO - -------------------------- Completed Secret Sync --------------------------"
+{{- if .Values.NiFiSync.s3Sync.enabled }}
+
+  s3sync.py: |
+    #!/usr/bin/env python3
+    """S3 sync helper for NiFi, backed by boto3.
+
+    Drop-in replacement for the MinIO ``mc`` client. AWS credentials resolve
+    through boto3's default provider chain when USE_IRSA=true (EKS IRSA
+    web-identity token, then EC2/instance profile); otherwise they come from
+    S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (MinIO and other static-key setups).
+
+    Subcommands map onto the old ``mc`` operations:
+      wait-ready       block until the bucket is reachable   (mc alias set)
+      prefix-exists    exit 0 if any object under a prefix    (mc ls | grep)
+      put-placeholder  upload a .placeholder object           (mc pipe)
+      mirror-down      download an S3 prefix into a directory (mc mirror s3->fs)
+      mirror-up        upload a directory to an S3 prefix     (mc mirror fs->s3)
+      flow-backup      versioned flow.json.gz backup, archive
+                       mirror, and retention pruning          (custom mc logic)
+
+    Configuration is read from the environment so the surrounding shell keeps
+    owning orchestration (loops, vault preamble, secret creation):
+      S3_BUCKET, S3_ENDPOINT, AWS_DEFAULT_REGION (or S3_REGION)
+      USE_IRSA, S3_INSECURE
+      S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN (when not IRSA)
+      instanceName, POD_NAME                          (flow-backup)
+      RETENTION_ENABLED, RETENTION_DRY_RUN            (flow-backup)
+      FLOW_KEEP_DAYS, FLOW_MAX_VERSIONS               (flow-backup)
+      ARCHIVE_RETENTION_ENABLED, ARCHIVE_KEEP_DAYS    (flow-backup)
+    """
+    import argparse
+    import hashlib
+    import os
+    import platform
+    import sys
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        import boto3
+        import botocore
+        from boto3.s3.transfer import TransferConfig
+        from botocore.config import Config as BotoConfig
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError as exc:
+        sys.stderr.write(
+            "Missing dependency: %s. The s3-sync image must bundle boto3.\n" % exc
+        )
+        sys.exit(1)
+
+    PLACEHOLDER = ".placeholder"
+
+    # Single-threaded transfers avoid s3transfer thread-manager hangs seen against
+    # some S3-compatible endpoints (e.g. MinIO) in constrained containers;
+    # multipart is still used, just sequentially.
+    TRANSFER = TransferConfig(use_threads=False)
+
+
+    def log(msg):
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print("%s - %s" % (stamp, msg), flush=True)
+
+
+    def env_bool(name, default=False):
+        val = os.environ.get(name)
+        if val is None:
+            return default
+        return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+    def env_int(name, default=0):
+        try:
+            return int(os.environ.get(name, "").strip())
+        except (TypeError, ValueError):
+            return default
+
+
+    def bucket_name():
+        bkt = os.environ.get("S3_BUCKET")
+        if not bkt:
+            log("ERROR - S3_BUCKET is not set")
+            sys.exit(1)
+        return bkt
+
+
+    def norm_prefix(prefix):
+        return (prefix or "").strip("/")
+
+
+    def make_client():
+        endpoint = os.environ.get("S3_ENDPOINT") or None
+        region = (
+            os.environ.get("AWS_DEFAULT_REGION")
+            or os.environ.get("S3_REGION")
+            or "us-east-1"
+        )
+        insecure = env_bool("S3_INSECURE", False)
+        use_irsa = env_bool("USE_IRSA", False)
+
+        s3_opts = {}
+        # Custom endpoints (MinIO, VPC endpoints) generally require path-style
+        # addressing; leave AWS on its virtual-hosted default.
+        if endpoint:
+            s3_opts["addressing_style"] = "path"
+        cfg = BotoConfig(
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 5, "mode": "standard"},
+            s3=s3_opts,
+        )
+        kwargs = dict(
+            endpoint_url=endpoint,
+            region_name=region,
+            verify=not insecure,
+            config=cfg,
+        )
+        if use_irsa:
+            role_arn = os.environ.get("AWS_ROLE_ARN")
+            token_file = os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE")
+            if role_arn and token_file:
+                auth_mode = "IRSA web-identity (role=%s)" % role_arn
+            else:
+                auth_mode = "default chain (IRSA env not detected; instance profile?)"
+        else:
+            access = os.environ.get("S3_ACCESS_KEY_ID")
+            secret = os.environ.get("S3_SECRET_ACCESS_KEY")
+            if access and secret:
+                kwargs["aws_access_key_id"] = access
+                kwargs["aws_secret_access_key"] = secret
+                token = os.environ.get("S3_SESSION_TOKEN")
+                if token:
+                    kwargs["aws_session_token"] = token
+                # Hint only — the access key id is not secret; the secret is never logged.
+                auth_mode = "static key (id=%s***)" % access[:4]
+            else:
+                auth_mode = "default chain (no static keys)"
+                log(
+                    "WARNING - USE_IRSA is false but S3_ACCESS_KEY_ID / "
+                    "S3_SECRET_ACCESS_KEY are unset; falling back to the "
+                    "default credential chain"
+                )
+        if insecure:
+            try:
+                import urllib3
+
+                urllib3.disable_warnings()
+            except Exception:
+                pass
+
+        log(
+            "Backend: boto3 %s (botocore %s), python %s | endpoint=%s | "
+            "region=%s | addressing=%s | tls_verify=%s | auth=%s | "
+            "transfers=single-threaded, connect_timeout=10s, read_timeout=60s"
+            % (
+                boto3.__version__,
+                botocore.__version__,
+                platform.python_version(),
+                endpoint or "(default AWS S3)",
+                region,
+                s3_opts.get("addressing_style", "auto (virtual-hosted)"),
+                not insecure,
+                auth_mode,
+            )
+        )
+        return boto3.client("s3", **kwargs)
+
+
+    def sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+
+    def iter_objects(client, bucket, prefix):
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                yield obj
+
+
+    def delete_keys(client, bucket, keys, dry_run, tag):
+        if not keys:
+            return
+        if dry_run:
+            for key in keys:
+                log("[%s dry-run] would delete s3://%s/%s" % (tag, bucket, key))
+            return
+        # delete_objects accepts at most 1000 keys per request.
+        for start in range(0, len(keys), 1000):
+            batch = keys[start:start + 1000]
+            client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+            )
+            for key in batch:
+                log("[%s] deleted s3://%s/%s" % (tag, bucket, key))
+
+
+    # ---------------------------------------------------------------- commands
+    def cmd_wait_ready(client, args):
+        bucket = bucket_name()
+        interval = env_int("S3_WAIT_INTERVAL", 30) or 30
+        while True:
+            try:
+                client.head_bucket(Bucket=bucket)
+                log("S3 bucket '%s' is reachable" % bucket)
+                return 0
+            except (ClientError, BotoCoreError) as exc:
+                log(
+                    "Unable to reach S3 bucket '%s' (%s). Retrying in %ds..."
+                    % (bucket, exc, interval)
+                )
+                time.sleep(interval)
+
+
+    def cmd_prefix_exists(client, args):
+        bucket = bucket_name()
+        prefix = norm_prefix(args.remote)
+        resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+        return 0 if resp.get("KeyCount", 0) > 0 else 1
+
+
+    def cmd_put_placeholder(client, args):
+        bucket = bucket_name()
+        key = "%s/%s" % (norm_prefix(args.remote), PLACEHOLDER)
+        client.put_object(Bucket=bucket, Key=key, Body=b"placeholder\n")
+        log("Created placeholder s3://%s/%s" % (bucket, key))
+        return 0
+
+
+    def cmd_mirror_down(client, args):
+        bucket = bucket_name()
+        prefix = norm_prefix(args.remote)
+        local = args.local
+        os.makedirs(local, exist_ok=True)
+        count = 0
+        for obj in iter_objects(client, bucket, prefix + "/"):
+            key = obj["Key"]
+            rel = key[len(prefix):].lstrip("/")
+            if not rel or key.endswith("/"):
+                continue
+            if args.exclude and os.path.basename(key) == args.exclude:
+                continue
+            dest = os.path.join(local, rel)
+            if not args.overwrite and os.path.exists(dest):
+                if os.path.getsize(dest) == obj.get("Size", -1):
+                    continue
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            log("  downloading s3://%s/%s (%s bytes)" % (bucket, key, obj.get("Size", "?")))
+            client.download_file(bucket, key, dest, Config=TRANSFER)
+            count += 1
+        log("mirror-down s3://%s/%s -> %s (%d object(s))" % (bucket, prefix, local, count))
+        return 0
+
+
+    def cmd_mirror_up(client, args):
+        bucket = bucket_name()
+        prefix = norm_prefix(args.remote)
+        local = args.local
+        if not os.path.isdir(local):
+            log("mirror-up source %s not found; nothing to do" % local)
+            return 0
+        count = 0
+        for root, _dirs, files in os.walk(local):
+            for name in files:
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, local).replace(os.sep, "/")
+                key = "%s/%s" % (prefix, rel)
+                log("  uploading %s -> s3://%s/%s" % (full, bucket, key))
+                client.upload_file(full, bucket, key, Config=TRANSFER)
+                count += 1
+        log("mirror-up %s -> s3://%s/%s (%d object(s))" % (local, bucket, prefix, count))
+        return 0
+
+
+    def _remote_flow_hash(client, bucket, key):
+        """Return the sha256 of the remote flow.json.gz, or '' if absent.
+
+        Prefer the sha256 stashed in object metadata at upload time; fall back
+        to downloading and hashing when the metadata is missing (objects written
+        by an older client).
+        """
+        try:
+            head = client.head_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return ""
+            raise
+        meta_hash = head.get("Metadata", {}).get("sha256")
+        if meta_hash:
+            return meta_hash
+        tmp = "/tmp/remote-flow.json.gz"
+        client.download_file(bucket, key, tmp)
+        try:
+            return sha256_file(tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+    def cmd_flow_backup(client, args):
+        bucket = bucket_name()
+        instance = os.environ.get("instanceName")
+        pod = os.environ.get("POD_NAME")
+        if not instance or not pod:
+            log("ERROR - instanceName and POD_NAME are required for flow-backup")
+            return 1
+
+        flow_path = os.environ.get("FLOW_PATH", "/opt/nifi/data/flow.json.gz")
+        archive_path = os.environ.get("ARCHIVE_PATH", "/opt/nifi/data/archive")
+        base = "%s/backup/%s" % (instance, pod)
+        remote_current = "%s/flow.json.gz" % base
+        versions_prefix = "%s/flow-backup" % base
+        remote_archive = "%s/archive" % base
+
+        # ---------- flow.json.gz upload (only when changed) ----------
+        if os.path.isfile(flow_path):
+            local_hash = sha256_file(flow_path)
+            remote_hash = _remote_flow_hash(client, bucket, remote_current)
+            if local_hash == remote_hash:
+                log("No changes detected in flow.json.gz. Skipping flow upload.")
+            else:
+                if remote_hash:
+                    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+                    versioned = "%s/%s-flow.json.gz" % (versions_prefix, stamp)
+                    log("Changes detected. Archiving previous flow.json.gz to %s" % versioned)
+                    try:
+                        client.copy_object(
+                            Bucket=bucket,
+                            Key=versioned,
+                            CopySource={"Bucket": bucket, "Key": remote_current},
+                        )
+                    except ClientError as exc:
+                        log("Warning: failed to archive old flow.json.gz (%s). Continuing." % exc)
+                else:
+                    log("No previous remote flow.json.gz found; this will be the first backup.")
+                log("Uploading updated flow.json.gz to %s" % remote_current)
+                try:
+                    client.upload_file(
+                        flow_path,
+                        bucket,
+                        remote_current,
+                        ExtraArgs={"Metadata": {"sha256": local_hash}},
+                        Config=TRANSFER,
+                    )
+                    log("Uploaded flow.json.gz (sha256 recorded in object metadata).")
+                except (ClientError, BotoCoreError) as exc:
+                    log("Warning: Failed to upload updated flow.json.gz (%s)" % exc)
+        else:
+            log("flow.json.gz not found at %s. Skipping flow upload." % flow_path)
+
+        # ---------- archive/ sync (always) ----------
+        if os.path.isdir(archive_path):
+            log("Syncing NiFi archive directory to %s" % remote_archive)
+            mirror_args = argparse.Namespace(
+                local=archive_path, remote=remote_archive, overwrite=True
+            )
+            try:
+                cmd_mirror_up(client, mirror_args)
+            except (ClientError, BotoCoreError) as exc:
+                log("Warning: Archive sync failed (%s)" % exc)
+        else:
+            log("Archive path %s not found. Skipping archive sync." % archive_path)
+
+        # ---------- retention (always) ----------
+        prune_flow_backups(client, bucket, versions_prefix)
+        prune_remote_archive(client, bucket, remote_archive)
+        return 0
+
+
+    def prune_flow_backups(client, bucket, versions_prefix):
+        if not env_bool("RETENTION_ENABLED", False):
+            return
+        dry_run = env_bool("RETENTION_DRY_RUN", False)
+        keep_days = env_int("FLOW_KEEP_DAYS", 0)
+        max_versions = env_int("FLOW_MAX_VERSIONS", 0)
+
+        objs = sorted(
+            iter_objects(client, bucket, versions_prefix + "/"),
+            key=lambda o: o["LastModified"],
+        )
+        objs = [o for o in objs if not o["Key"].endswith("/")]
+        if not objs:
+            log("[retention] No versioned flow backups under %s; skipping." % versions_prefix)
+            return
+        log(
+            "[retention] %d versioned flow file(s) (keepDays=%s, maxVersions=%s, dryRun=%s)"
+            % (len(objs), keep_days, max_versions, dry_run)
+        )
+
+        doomed = set()
+        # Age-based: anything older than keepDays.
+        if keep_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+            for obj in objs:
+                if obj["LastModified"] < cutoff:
+                    doomed.add(obj["Key"])
+        # Count-based: keep only the newest max_versions.
+        if max_versions > 0 and len(objs) > max_versions:
+            for obj in objs[: len(objs) - max_versions]:
+                doomed.add(obj["Key"])
+
+        delete_keys(client, bucket, sorted(doomed), dry_run, "retention")
+
+
+    def prune_remote_archive(client, bucket, remote_archive):
+        if not env_bool("RETENTION_ENABLED", False):
+            return
+        if not env_bool("ARCHIVE_RETENTION_ENABLED", False):
+            return
+        dry_run = env_bool("RETENTION_DRY_RUN", False)
+        keep_days = env_int("ARCHIVE_KEEP_DAYS", 0)
+        if keep_days <= 0:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        doomed = [
+            obj["Key"]
+            for obj in iter_objects(client, bucket, remote_archive + "/")
+            if not obj["Key"].endswith("/") and obj["LastModified"] < cutoff
+        ]
+        log(
+            "[retention] archive under %s: %d object(s) older than %dd (dryRun=%s)"
+            % (remote_archive, len(doomed), keep_days, dry_run)
+        )
+        delete_keys(client, bucket, doomed, dry_run, "retention")
+
+
+    def build_parser():
+        parser = argparse.ArgumentParser(description="NiFi S3 sync helper (boto3)")
+        sub = parser.add_subparsers(dest="command", required=True)
+
+        sub.add_parser("wait-ready").set_defaults(func=cmd_wait_ready)
+
+        p_exists = sub.add_parser("prefix-exists")
+        p_exists.add_argument("--remote", required=True)
+        p_exists.set_defaults(func=cmd_prefix_exists)
+
+        p_place = sub.add_parser("put-placeholder")
+        p_place.add_argument("--remote", required=True)
+        p_place.set_defaults(func=cmd_put_placeholder)
+
+        p_down = sub.add_parser("mirror-down")
+        p_down.add_argument("--remote", required=True)
+        p_down.add_argument("--local", required=True)
+        p_down.add_argument("--exclude", default=None)
+        p_down.add_argument("--overwrite", action="store_true")
+        p_down.set_defaults(func=cmd_mirror_down)
+
+        p_up = sub.add_parser("mirror-up")
+        p_up.add_argument("--remote", required=True)
+        p_up.add_argument("--local", required=True)
+        p_up.add_argument("--overwrite", action="store_true")
+        p_up.set_defaults(func=cmd_mirror_up)
+
+        sub.add_parser("flow-backup").set_defaults(func=cmd_flow_backup)
+        return parser
+
+
+    def main():
+        args = build_parser().parse_args()
+        client = make_client()
+        try:
+            sys.exit(args.func(client, args))
+        except (ClientError, BotoCoreError) as exc:
+            log("ERROR - %s failed: %s" % (args.command, exc))
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        main()
+{{- end }}
 
 ---
 #This is to allow access to read/modify secrets in kubernetes

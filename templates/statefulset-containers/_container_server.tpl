@@ -570,9 +570,7 @@
     {{- if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled}}
           - mountPath: /opt/nifi/nifi-sync/scripts
             name: nifisync-scripts
-    {{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}    
-          - mountPath: /.mc
-            name: s3config
+    {{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}
           - mountPath: /opt/nifi/nifi-current/logs
             {{- if and .Values.persistence.enabled .Values.persistence.subPath.enabled (not .Values.persistence.logStorage.DisallowSubPath) }}
             name: {{ .Values.persistence.subPath.name }}
