@@ -231,8 +231,11 @@
               echo "Starting file system sync loop"
               {{- range .Values.NiFiSync.syncPaths }}
               {{- if eq .pathType "fs" }}
+              {{- $orphans := "dryrun" }}
+              {{- if kindIs "bool" .deleteOrphans }}{{ $orphans = ternary "delete" "off" .deleteOrphans }}{{ else if .deleteOrphans }}{{ $orphans = .deleteOrphans }}{{ end }}
+              {{- if not (has $orphans (list "off" "dryrun" "delete")) }}{{ fail (printf "NiFiSync.syncPaths %q: deleteOrphans must be one of off/dryrun/delete (or true/false); got %v" .pathName .deleteOrphans) }}{{ end }}
               echo "Syncing Remote Path $instanceName/{{ .remotePath }} to {{ .localPath }}"
-              python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local {{ .localPath }} --exclude .placeholder --overwrite{{ if .deleteOrphans }} --delete{{ end }} || echo "Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
+              python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local {{ .localPath }} --exclude .placeholder --overwrite --orphans {{ $orphans }} || echo "Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
               {{- end }}
               {{- end }}
               echo "File sync completed. Sleeping for {{ .Values.NiFiSync.s3Sync.syncInterval }}."

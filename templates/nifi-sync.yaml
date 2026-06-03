@@ -1375,13 +1375,17 @@ data:
             log("Downloaded %d file(s) from s3://%s/%s to %s" % (count, bucket, prefix, local))
         else:
             log("Up to date: no files to download from s3://%s/%s" % (bucket, prefix))
-        if args.delete:
-            _prune_local_orphans(local, prefix, bucket, remote_rel, remote_total, args.exclude)
+        if args.orphans != "off":
+            _prune_local_orphans(
+                local, prefix, bucket, remote_rel, remote_total,
+                args.exclude, args.orphans == "dryrun",
+            )
         return 0
 
 
-    def _prune_local_orphans(local, prefix, bucket, remote_rel, remote_total, exclude):
-        """Delete local files under *local* that are not present in S3.
+    def _prune_local_orphans(local, prefix, bucket, remote_rel, remote_total, exclude, dry_run):
+        """Remove (or, in dry-run, just report) local files under *local* that
+        are not present in S3.
 
         Only runs after a fully successful listing (see cmd_mirror_down). As an
         extra guard, refuses to prune when the remote prefix returned zero
@@ -1403,19 +1407,24 @@ data:
                 rel = os.path.relpath(full, local).replace(os.sep, "/")
                 if rel in remote_rel or name == exclude:
                     continue
-                os.remove(full)
-                log("  removed local orphan %s (not in S3)" % full)
+                if dry_run:
+                    log("  [dry-run] would remove local orphan %s (not in S3)" % full)
+                else:
+                    os.remove(full)
+                    log("  removed local orphan %s (not in S3)" % full)
                 removed += 1
             # Clean up directories left empty by the prune (never the root).
-            if root != local:
+            if not dry_run and root != local:
                 try:
                     os.rmdir(root)
                 except OSError:
                     pass
-        if removed:
-            log("Removed %d local file(s) not present in s3://%s/%s" % (removed, bucket, prefix))
-        else:
+        if not removed:
             log("No local orphans to remove for %s" % local)
+        elif dry_run:
+            log("[dry-run] %d local file(s) not in s3://%s/%s would be removed" % (removed, bucket, prefix))
+        else:
+            log("Removed %d local file(s) not present in s3://%s/%s" % (removed, bucket, prefix))
 
 
     def cmd_mirror_up(client, args):
@@ -1616,10 +1625,13 @@ data:
         p_down.add_argument("--exclude", default=None)
         p_down.add_argument("--overwrite", action="store_true")
         p_down.add_argument(
-            "--delete",
-            action="store_true",
-            help="remove local files not present in S3 (skipped if the remote "
-                 "prefix is empty or unreachable)",
+            "--orphans",
+            choices=("off", "dryrun", "delete"),
+            default="off",
+            help="how to handle local files not present in S3: off (leave "
+                 "them), dryrun (log what would be removed), delete (remove "
+                 "them). Always skipped if the remote prefix is empty or "
+                 "unreachable.",
         )
         p_down.set_defaults(func=cmd_mirror_down)
 
