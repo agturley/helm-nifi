@@ -3,7 +3,7 @@
       - name: s3-sync
         image: {{ .Values.NiFiSync.s3Sync.sidecar.image }}
         resources:
-{{ toYaml .Values.syncresources | indent 10 }}             
+{{ toYaml .Values.NiFiSync.s3Sync.resources | indent 10 }}             
 
 #vault envFrom
 {{- /* collect Vault secrets with secretMode=env for envFrom */ -}}

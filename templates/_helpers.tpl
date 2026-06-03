@@ -220,6 +220,33 @@ Modes (properties.secretsMode):
   env         – variables already set; nothing emitted
   none        – set from Helm values.yaml literals
 */}}
+{{/*
+nifi.awsSecretsSyncWait
+Emits a shell block that blocks until the awsSecretsSync sidecar has written
+its readiness sentinel file (outputPath/.aws-secrets-ready).  Only emitted
+when awsSecretsSync.enabled=true and the effective secretsMode is "file-dir",
+because that is the only case where containers read files from outputPath.
+*/}}
+{{- define "nifi.awsSecretsSyncWait" -}}
+{{- if and .Values.awsSecretsSync.enabled (eq (include "nifi.effectiveSecretsMode" .) "file-dir") }}
+          # Wait for awsSecretsSync to complete its initial fetch before reading credential files
+          _aws_sentinel={{ printf "%s/.aws-secrets-ready" .Values.awsSecretsSync.outputPath | quote }}
+          _aws_timeout=${AWS_SECRETS_WAIT_TIMEOUT:-120}
+          _aws_start=$(date +%s)
+          echo "[{{ .Template.Name | base | trimSuffix ".tpl" }}] Waiting for AWS secrets sentinel: $_aws_sentinel (timeout ${_aws_timeout}s)"
+          while [ ! -f "$_aws_sentinel" ]; do
+            _aws_now=$(date +%s)
+            if [ $(( _aws_now - _aws_start )) -ge "$_aws_timeout" ]; then
+              echo "[{{ .Template.Name | base | trimSuffix ".tpl" }}] Timed out waiting for AWS secrets sentinel: $_aws_sentinel" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "[{{ .Template.Name | base | trimSuffix ".tpl" }}] AWS secrets ready."
+          unset _aws_sentinel _aws_timeout _aws_start _aws_now
+{{- end }}
+{{- end -}}
+
 {{- define "nifi.secretsInit" -}}
 {{- $sm := include "nifi.effectiveSecretsMode" . -}}
 {{- $sp := .Values.properties.secretsFilePath -}}

@@ -113,6 +113,12 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
           items:
             - key: "flow.xml"
               path: "flow.xml"
+      - name: "logback-xml"
+        configMap:
+          name: {{ template "apache-nifi.fullname" . }}-config
+          items:
+            - key: "logback.xml"
+              path: "logback.xml"
     {{- if .Values.persistence.flowfileRepoStorage.inMemory }}
       - name: flowfile-repository
         emptyDir:
@@ -146,14 +152,14 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
 {{- if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled}}
       - name: nifisync-scripts
         configMap:
-          name: nifisync-scripts
+          name: {{ template "apache-nifi.fullname" $ }}-nifisync-scripts
       - name: secret-modifier-token
         secret:
           secretName: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier-token
 {{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}
 {{- if .Values.NiFiSync.s3Sync.enabled }}
     {{- range .Values.NiFiSync.syncPaths }}
-    {{- if ne .pathType "fs" }}
+    {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
       - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
         secret: 
     {{- $secretType := (default $.Values.NiFiSync.DefaultSecretType .secretType) | lower }}

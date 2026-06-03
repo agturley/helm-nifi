@@ -34,7 +34,7 @@ spec:
 {{- end }}
 {{- if .Values.NiFiSync.s3Sync.enable }}
 {{- range .Values.NiFiSync.syncPaths }}
-{{- if eq .pathType "tls-secret" }}
+{{- if and (default true .enabled) (eq .pathType "tls-secret") }}
 {{- if eq .Values.NiFiSync.syncPaths.pathName "ingress-cert" }}
   tls:
   {{- range .Values.ingress.tls }}

@@ -132,6 +132,11 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         command: ["python3", "/opt/nifi/nifi-sync/scripts/nifi-policysync.py"]
+        env:
+          - name: RESET_AUTH_FILES
+            value: {{ .Values.NiFiSync.UserPolicySync.resetAuthFiles | default false | quote }}
+          - name: INITIAL_ADMIN_IDENTITY
+            value: {{ if .Values.auth.ldap.enabled }}{{ .Values.auth.ldap.admin | default "" | quote }}{{ else }}{{ .Values.auth.admin | default "" | quote }}{{ end }}
         resources:
 {{ toYaml .Values.syncresources | indent 10 }}        
         volumeMounts:

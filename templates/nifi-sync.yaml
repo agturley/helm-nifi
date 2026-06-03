@@ -4,7 +4,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: nifisync-scripts
+  name: {{ template "apache-nifi.fullname" . }}-nifisync-scripts
   namespace: {{ .Values.namespace }}
 data:
 {{ if .Values.NiFiSync.UserPolicySync.enabled }}
@@ -21,6 +21,7 @@ data:
 
     Tracks dropped external groups in `external_groups.json` and removes their policies.
     """
+    from __future__ import annotations
     import gzip
     import json
     import os
@@ -190,10 +191,39 @@ data:
         if USERS_XML_PATH.exists():
             tree = ET.parse(USERS_XML_PATH)
             root = tree.getroot()
+
+            # Consolidate multiple <users> elements into one — caused by the
+            # empty-element-is-falsy bug where `root.find("users") or
+            # ET.SubElement(...)` created a new wrapper for every user.
+            all_users_elems = root.findall("users")
+            if len(all_users_elems) > 1:
+                primary = all_users_elems[0]
+                for extra in all_users_elems[1:]:
+                    for child in list(extra):
+                        primary.append(child)
+                    root.remove(extra)
+                logging.warning(
+                    f"Consolidated {len(all_users_elems)} <users> elements into one"
+                )
+
+            # Normalize element order in case file was written with users before
+            # groups (old policysync or NiFi 1.x). tenants.xsd xs:sequence
+            # requires <groups> before <users>.
+            _g = root.find("groups")
+            _u = root.find("users")
+            if _g is not None and _u is not None:
+                children = list(root)
+                if children.index(_u) < children.index(_g):
+                    root.remove(_g)
+                    root.remove(_u)
+                    root.append(_g)
+                    root.append(_u)
+                    logging.debug("Normalized users.xml: moved <groups> before <users>")
         else:
             root = ET.Element("tenants")
-            ET.SubElement(root, "users")
+            # NiFi tenants.xsd xs:sequence requires groups before users
             ET.SubElement(root, "groups")
+            ET.SubElement(root, "users")
             tree = ET.ElementTree(root)
         return tree, root
 
@@ -213,7 +243,9 @@ data:
         global changed_users
         if identity in user_ids:
             return user_ids[identity]
-        users_elem = root.find("users") or ET.SubElement(root, "users")
+        users_elem = root.find("users")
+        if users_elem is None:
+            users_elem = ET.SubElement(root, "users")
         uid = generate_id("user", identity)
         ET.SubElement(users_elem, "user", {"identifier": uid, "identity": identity})
         user_ids[identity] = uid
@@ -225,7 +257,16 @@ data:
         global changed_users
         if name in group_ids:
             return group_ids[name]
-        groups_elem = root.find("groups") or ET.SubElement(root, "groups")
+        groups_elem = root.find("groups")
+        if groups_elem is None:
+            # Insert groups before users to match NiFi tenants.xsd xs:sequence order
+            groups_elem = ET.Element("groups")
+            users_elem = root.find("users")
+            if users_elem is not None:
+                users_idx = list(root).index(users_elem)
+                root.insert(users_idx, groups_elem)
+            else:
+                root.append(groups_elem)
         gid = generate_id("group", name)
         ET.SubElement(groups_elem, "group", {"identifier": gid, "name": name})
         group_ids[name] = gid
@@ -290,12 +331,29 @@ data:
         current_users: set[str] = set()
 
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+        if os.getenv("RESET_AUTH_FILES", "").lower() in ("1", "true", "yes"):
+            logging.warning("RESET_AUTH_FILES is set — wiping auth files for a clean slate (debug only)")
+            for path in (USERS_XML_PATH, AUTH_XML_PATH, GROUP_TRACK_FILE, USER_TRACK_FILE, ROOT_PGID_CACHE):
+                if path.exists():
+                    path.unlink()
+                    logging.warning(f"Deleted {path}")
+
         users_tree, users_root = load_users_xml()
         user_ids, group_ids = current_id_maps(users_root)
         root_pg_id = get_root_pg_id()
         # Ensure monitoring user exists and is tracked before purges
         mon_uid = ensure_user(users_root, MONITORING_USER, user_ids)
         current_users.add(MONITORING_USER)
+
+        # Ensure the initial admin identity (from authorizers.xml / Helm auth.admin)
+        # always exists in users.xml. NiFi only bootstraps this on a truly fresh
+        # start (no users.xml), so policysync must keep it present.
+        initial_admin = os.getenv("INITIAL_ADMIN_IDENTITY", "").strip()
+        if initial_admin:
+            ensure_user(users_root, initial_admin, user_ids)
+            current_users.add(initial_admin)
+            logging.debug(f"Ensured initial admin identity '{initial_admin}'")
         
         # Create & track internal managed NiFi users
         apply_managed_users(users_root, user_ids, current_users)
@@ -472,15 +530,21 @@ data:
         # Backup & write
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
         if changed_users:
-            dst = BACKUP_DIR / f"{USERS_XML_PATH.name}.{ts}.bak"
-            shutil.copy2(USERS_XML_PATH, dst)
-            logging.debug(f"Backed up users.xml → {dst}")
+            if USERS_XML_PATH.exists():
+                dst = BACKUP_DIR / f"{USERS_XML_PATH.name}.{ts}.bak"
+                shutil.copy2(USERS_XML_PATH, dst)
+                logging.debug(f"Backed up users.xml → {dst}")
+            else:
+                logging.debug("users.xml does not exist yet (first boot); skipping backup")
             USERS_XML_PATH.write_text(prettify(users_root))
             logging.info("users.xml updated")
         if changed_auth:
-            dst = BACKUP_DIR / f"{AUTH_XML_PATH.name}.{ts}.bak"
-            shutil.copy2(AUTH_XML_PATH, dst)
-            logging.debug(f"Backed up authorizations.xml → {dst}")
+            if AUTH_XML_PATH.exists():
+                dst = BACKUP_DIR / f"{AUTH_XML_PATH.name}.{ts}.bak"
+                shutil.copy2(AUTH_XML_PATH, dst)
+                logging.debug(f"Backed up authorizations.xml → {dst}")
+            else:
+                logging.debug("authorizations.xml does not exist yet (first boot); skipping backup")
             AUTH_XML_PATH.write_text(prettify(auth_root))
             logging.info("authorizations.xml updated")
         if not changed_users and not changed_auth:
@@ -815,6 +879,7 @@ data:
     
     # Iterate over each syncPath with pathType: generic-secret, tls-secret, ca-secret, etc.
     {{- range .Values.NiFiSync.syncPaths }}
+    {{- if and (default true .enabled) (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
       {{- $syncPath := . }}
       {{- $pathType := .pathType }}
       {{- $secretType := (default $.Values.NiFiSync.DefaultSecretType $syncPath.secretType) | lower }}
@@ -1031,6 +1096,7 @@ data:
         fi
 
       {{- end }}
+    {{- end }}{{- /* if .enabled */}}
     {{- end }}
 
     # Output the list of found and added/updated secrets

@@ -21,6 +21,9 @@ spec:
   template:
     metadata:
       annotations:
+{{- if .Values.sts.pod.annotations }}
+{{ toYaml .Values.sts.pod.annotations | indent 8 }}
+{{- end }}
       labels:
         {{- include "nifi.commonLabels" . | nindent 8 }}
         role: "config-sync"
@@ -103,6 +106,8 @@ spec:
 {{ if .Values.NiFiSync.s3Sync.enabled }}
       - name: s3-secret-sync
         image: {{ .Values.NiFiSync.s3Sync.sidecar.image }}
+        resources:
+{{ toYaml .Values.NiFiSync.s3Sync.resources | indent 10 }}
 
 #vault envFrom
 {{- /* collect Vault secrets with secretMode=env for envFrom */ -}}
@@ -375,7 +380,7 @@ spec:
 {{- if .Values.NiFiSync.s3Sync.enabled}}
       - name: nifisync-scripts
         configMap:
-          name: nifisync-scripts
+          name: {{ template "apache-nifi.fullname" $ }}-nifisync-scripts
       - name: secret-modifier-token
         secret:
           secretName: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier-token

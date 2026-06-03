@@ -222,6 +222,16 @@ Logging:
   clusterOutput:
   kubernetesDnsServer:
 
+logging:
+  # Extra loggers injected into logback.xml at deploy time.
+  # Each entry requires 'name' and 'level'; 'additivity' is optional.
+  # Example: enable AWS SDK debug logging
+  # extraLoggers:
+  #   - name: software.amazon.awssdk
+  #     level: DEBUG
+  #   - name: software.amazon.awssdk.request
+  #     level: DEBUG
+  extraLoggers: []
 
 VaultNiFiSecrets:
   secretProvider: vaultSecretOperator  #vaultSidecar  
@@ -292,6 +302,9 @@ awsSecretsSync:
   #   outputFile: my-secret      # filename (or dir name for JSON secrets) written
   #                              # under outputPath; defaults to the last path component
   #   outputPath: ""             # override the default outputPath for this secret only
+  #   flattenTo: ""              # also copy each JSON key as a flat file into this dir
+  #                              # (e.g. set to properties.secretsFilePath so that
+  #                              #  secretsMode: file-dir can read the keys directly)
 
 NiFiSync:
   # Define one or more paths to sync dynamically, shared between different sync methods
@@ -308,6 +321,8 @@ NiFiSync:
     mount: #"e1rke400-e1-poc2000"
   DefaultSecretType: kubernetes #Global secret type: 'kubernetes' or 'vault' (vault NifiSync.Vault must be enalbed to use 'vault')
   syncPaths:
+    # Each path supports an optional 'enabled' field (default: true).
+    # Set 'enabled: false' to skip a path without removing it from the config.
     - pathName: custom-drivers
       localPath: /opt/nifi/data/custom/drivers
       remotePath: custom/drivers
@@ -326,6 +341,7 @@ NiFiSync:
       pathType: generic-secret
 
     - pathName: ingress-cert
+      enabled: true  # set to false to disable (e.g. AWS deployments where ingress cert is managed externally)
       localPath: /opt/nifi/data/custom/tls/nifi-ingress-cert
       remotePath: system/nifi-ingress-cert
       pathType: tls-secret
@@ -341,6 +357,19 @@ NiFiSync:
     # User adjustable endpoint for S3-compatible services (AWS, MinIO, etc.)
     endpoint: https://s3.us-east-1.amazonaws.com # Default AWS S3 URL. Replace for MinIO.
     bucket: mybucket
+    # useIRSA: when true, s3sync authenticates using the pod's IAM service account
+    # (EKS IRSA / EC2 instance profile) instead of explicit key/secret credentials.
+    # No S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY files are expected; the S3 creds
+    # file-wait is skipped and mc is configured with empty credentials so the AWS
+    # SDK credential chain (web identity token, instance metadata) takes over.
+    useIRSA: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
     sidecar:
       image: docker.io/agturley/nifi-utility:v1
     flowBackup:
@@ -358,6 +387,11 @@ NiFiSync:
 
   UserPolicySync:
     enabled: false
+
+    # Debug: delete users.xml, authorizations.xml, and tracker files before
+    # each run so the sidecar starts from a clean slate. Never enable in
+    # production — NiFi will lose all custom policies on every pod restart.
+    resetAuthFiles: false
 
     # External LDAP groups (not created in users.xml) & their roles
     externalGroupRoles:
@@ -710,6 +744,14 @@ certManager:
   # Source password of jvmCACertsPath/auto-detected JVM cacerts before re-keying.
   jvmCACertsStorePasswd: "changeit"
   replaceDefaultTrustStore: false
+  # List of Kubernetes secret names whose certificate files (.crt, .cer, .pem)
+  # will be imported into the NiFi truststore at pod startup. Each secret is
+  # mounted at /opt/nifi/nifi-current/tls/<secret-name>/. Useful for adding
+  # LDAP server CAs or other internal CAs not covered by the cluster issuer.
+  # Example:
+  #   caSecrets:
+  #     - ldap-ca-cert
+  caSecrets: []
   additionalDnsNames:
     - localhost
   refreshSeconds: 300

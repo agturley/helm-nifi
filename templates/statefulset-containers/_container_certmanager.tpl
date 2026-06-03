@@ -129,6 +129,7 @@
           trap "exit 0" TERM
           NODENAME=$(hostname)
           mkdir -p "${NIFI_HOME}"/tls/cert-manager
+{{ include "nifi.awsSecretsSyncWait" . }}
 {{ include "nifi.secretsInit" . }}
           # Note opportunity here to inject additional trusted certs named ca.crt in other
           # subdirectories of /opt/nifi/nifi-current/tls/, using custom secrets and/or configmaps.
@@ -166,9 +167,28 @@
                     -keystore "${NIFI_HOME}/tls/truststore-new.jks" \
                     -storepass "${NIFI_TLS_TRUSTSTORE_PASSWORD}"
           done
+          {{- if .Values.certManager.caSecrets }}
+          # Import any .crt/.cer/.pem from certManager.caSecrets mounts
+          {{- range .Values.certManager.caSecrets }}
+          for ca in "${NIFI_HOME}/tls/{{ . }}"/*.crt "${NIFI_HOME}/tls/{{ . }}"/*.cer "${NIFI_HOME}/tls/{{ . }}"/*.pem
+          do
+            [[ -f "$ca" ]] || continue
+            ALIAS="casecret-{{ . }}-$(echo $ca | sed 's|.*/||' | sed 's|\.[^.]*$||')"
+            echo "[cert-manager]   + ${ALIAS} (${ca})"
+            keytool -import \
+                    -noprompt \
+                    -trustcacerts \
+                    -alias "$ALIAS" \
+                    -storetype JKS \
+                    -file "$ca" \
+                    -keystore "${NIFI_HOME}/tls/truststore-new.jks" \
+                    -storepass "${NIFI_TLS_TRUSTSTORE_PASSWORD}" || true
+          done
+          {{- end }}
+          {{- end }}
           {{- if .Values.NiFiSync.s3Sync.enabled}}
           {{- range .Values.NiFiSync.syncPaths }}
-          {{- if eq .pathType "ca-secret" }}
+          {{- if and (default true .enabled) (eq .pathType "ca-secret") }}
           _found_ca=0
           for ca in {{ .localPath }}/*.crt {{ .localPath }}/*.cer {{ .localPath }}/*.pem
           do
@@ -203,7 +223,11 @@
           {{- if .Values.certManager.jvmCACertsPath }}
           JVM_CACERTS={{ .Values.certManager.jvmCACertsPath | quote }}
           {{- else }}
+          # Auto-detect JVM cacerts: check JAVA_HOME, common JVM paths, then RHEL/UBI9 system path
           JVM_CACERTS=$(find "${JAVA_HOME:-/usr/lib/jvm}" -name "cacerts" -path "*/security/*" 2>/dev/null | head -1)
+          if [ -z "$JVM_CACERTS" ] && [ -f "/etc/pki/java/cacerts" ]; then
+            JVM_CACERTS="/etc/pki/java/cacerts"
+          fi
           {{- end }}
           if [ -n "$JVM_CACERTS" ] && [ -f "$JVM_CACERTS" ]; then
             MERGED_CACERTS="${NIFI_HOME}/tls/cacerts-merged"
@@ -223,9 +247,24 @@
                       -keystore "$MERGED_CACERTS" \
                       -storepass "$_jvm_cacerts_storepass" 2>&1 || true
             done
+            {{- if .Values.certManager.caSecrets }}
+            # Also import certs from certManager.caSecrets mounts
+            {{- range .Values.certManager.caSecrets }}
+            for _ca_f in "${NIFI_HOME}/tls/{{ . }}"/*.crt "${NIFI_HOME}/tls/{{ . }}"/*.cer "${NIFI_HOME}/tls/{{ . }}"/*.pem; do
+              [ -f "$_ca_f" ] || continue
+              _ca_i=$((_ca_i + 1))
+              echo "[cert-manager]   + merged-ca-${_ca_i} (${_ca_f})"
+              keytool -importcert -noprompt -trustcacerts \
+                      -alias "merged-ca-${_ca_i}" \
+                      -file "$_ca_f" \
+                      -keystore "$MERGED_CACERTS" \
+                      -storepass "$_jvm_cacerts_storepass" 2>&1 || true
+            done
+            {{- end }}
+            {{- end }}
             {{- if .Values.NiFiSync.s3Sync.enabled }}
             {{- range .Values.NiFiSync.syncPaths }}
-            {{- if eq .pathType "ca-secret" }}
+            {{- if and (default true .enabled) (eq .pathType "ca-secret") }}
             # Also import S3-synced certs from {{ .localPath }} (ca-secret path)
             for _ca_f in {{ .localPath }}/*.crt {{ .localPath }}/*.cer {{ .localPath }}/*.pem; do
               [ -f "$_ca_f" ] || continue
@@ -297,7 +336,7 @@
         volumeMounts:
     {{- if .Values.NiFiSync.s3Sync.enabled}}
         {{- range .Values.NiFiSync.syncPaths }}
-        {{- if ne .pathType "fs" }}
+        {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
             mountPath: {{ .localPath }}
         {{- end }}
@@ -381,6 +420,10 @@
           {{- if .Values.extraVolumeMounts }}
 {{ toYaml .Values.extraVolumeMounts | indent 10 }}
           {{/* if .Values.extraVolumeMounts */}}{{ end }}
+          {{- if .Values.awsSecretsSync.enabled }}
+          - name: aws-secrets-path
+            mountPath: {{ .Values.awsSecretsSync.outputPath }}
+          {{- end }}
           {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") }}
           - name: k8s-secrets
             mountPath: {{ .Values.properties.secretsFilePath }}

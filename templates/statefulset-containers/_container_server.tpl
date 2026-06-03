@@ -122,6 +122,7 @@
           cp "${NIFI_HOME}/conf/bootstrap.template.conf" "${NIFI_HOME}/conf/bootstrap.conf"
 
           cat "${NIFI_HOME}/conf/nifi.temp" > "${NIFI_HOME}/conf/nifi.properties"
+{{ include "nifi.awsSecretsSyncWait" . }}
 {{ include "nifi.secretsInit" . }}
 {{- if and .Values.certManager.enabled .Values.certManager.useMergedCACerts }}
           # Keep JVM merged-cacerts password in sync with runtime secret value.
@@ -560,7 +561,7 @@
 
     {{- if .Values.NiFiSync.s3Sync.enabled}}
         {{- range .Values.NiFiSync.syncPaths }}
-        {{- if ne .pathType "fs" }}
+        {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
             mountPath: {{ .localPath }}
         {{- end }}
@@ -673,6 +674,9 @@
           - name: "flow-content"
             mountPath: /opt/nifi/data/flow.xml
             subPath: "flow.xml"
+          - name: "logback-xml"
+            mountPath: /opt/nifi/nifi-current/conf/logback.xml
+            subPath: "logback.xml"
           {{- range $secret := .Values.secrets }}
             {{- if $secret.mountPath }}
               {{- if $secret.keys }}
