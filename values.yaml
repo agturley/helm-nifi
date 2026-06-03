@@ -323,10 +323,21 @@ NiFiSync:
   syncPaths:
     # Each path supports an optional 'enabled' field (default: true).
     # Set 'enabled: false' to skip a path without removing it from the config.
+    #
+    # For pathType: fs, an optional 'deleteOrphans' field controls pruning of
+    # local files no longer present in S3 (like `mc mirror --remove`):
+    #   "dryrun"  (default) - only log which local files WOULD be removed
+    #   "delete"            - actually remove them
+    #   "off"               - never prune
+    # Booleans also work: true = delete, false = off. For safety, pruning is
+    # ALWAYS skipped when S3 is unreachable or the remote prefix returns no
+    # objects, so the local folder is never wiped by an outage or a
+    # misconfigured bucket/prefix.
     - pathName: custom-drivers
       localPath: /opt/nifi/data/custom/drivers
       remotePath: custom/drivers
       pathType: fs
+      deleteOrphans: "off"  # driver jars may be in use; don't prune
     - pathName: custom-extensions
       localPath: /opt/nifi/data/custom/extensions
       remotePath: custom/extensions
@@ -354,14 +365,29 @@ NiFiSync:
   s3Sync:
     enable: false
     syncInterval: 1d
+    # secretSync controls the separate "config-sync" Deployment that pulls the
+    # non-fs syncPaths (generic-secret/tls-secret/ca-secret) from S3 and writes
+    # them as Kubernetes secrets. It (and its RBAC) is only rendered when
+    # enabled here AND at least one enabled syncPath is a non-fs type, so it is
+    # skipped automatically when there are no secrets to sync. Set enabled:false
+    # to keep fs sync / flow backup while disabling the K8s secret sync entirely.
+    secretSync:
+      enabled: true
     # User adjustable endpoint for S3-compatible services (AWS, MinIO, etc.)
     endpoint: https://s3.us-east-1.amazonaws.com # Default AWS S3 URL. Replace for MinIO.
     bucket: mybucket
+    # AWS region used by the boto3 S3 client. For non-AWS endpoints (MinIO) any
+    # value is accepted; it only needs to be valid for real AWS S3.
+    region: us-east-1
+    # insecure: skip TLS certificate verification (equivalent to the old
+    # `mc --insecure`). Set true only for self-signed MinIO/test endpoints.
+    insecure: false
     # useIRSA: when true, s3sync authenticates using the pod's IAM service account
     # (EKS IRSA / EC2 instance profile) instead of explicit key/secret credentials.
-    # No S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY files are expected; the S3 creds
-    # file-wait is skipped and mc is configured with empty credentials so the AWS
-    # SDK credential chain (web identity token, instance metadata) takes over.
+    # The boto3 default credential chain (web identity token, instance metadata)
+    # resolves the role; no S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are required
+    # and the S3 creds file-wait is skipped. When false, credentials come from
+    # S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (MinIO and other static-key setups).
     useIRSA: false
     resources:
       requests:
@@ -371,6 +397,8 @@ NiFiSync:
         cpu: 1000m
         memory: 512Mi
     sidecar:
+      # The sidecar image must bundle python3 + boto3 (the sync logic now uses
+      # boto3 instead of the MinIO `mc` client). pyyaml is not required.
       image: docker.io/agturley/nifi-utility:v1
     flowBackup:
       enabled: true

@@ -67,10 +67,27 @@
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        - name: USE_IRSA
+          value: {{ .Values.NiFiSync.s3Sync.useIRSA | quote }}
+        - name: S3_INSECURE
+          value: {{ .Values.NiFiSync.s3Sync.insecure | quote }}
+        - name: AWS_DEFAULT_REGION
+          value: {{ .Values.NiFiSync.s3Sync.region | quote }}
         command: ["/bin/sh", "-c"]
         args:
         - |
           #!/bin/sh
+          # --- Prefix every stdout/stderr line with an ISO-8601 UTC timestamp ---
+          # Routes all output (including raw stderr from sub-tools and python)
+          # through one timestamper so every log line is machine-parseable.
+          if _ts_fifo="$(mktemp -u /tmp/ts.XXXXXX)" && mkfifo "$_ts_fifo" 2>/dev/null; then
+            while IFS= read -r _ts_line; do
+              printf '%s - %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$_ts_line"
+            done < "$_ts_fifo" &
+            exec > "$_ts_fifo" 2>&1
+            rm -f "$_ts_fifo"
+          fi
+          # --- end timestamp wrapper ---
 {{- /* START Wait for vault sidecar HTTP readiness on /ready (tries curl, wget, nc, falls back to port check) */ -}}
 {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           wait_for_sidecar_http_ready() {
@@ -156,225 +173,39 @@
           unset _creds_sp _creds_timeout _creds_start _creds_file
           {{- end }}
 {{ include "nifi.secretsInit" . }}
-          # Function to set up mc alias with retries
-          setup_mc_alias() {
-            until mc alias set s3 "$S3_ENDPOINT" "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY" --insecure; do
-              echo "$(date) - Unable to set mc alias. S3 might be unavailable. Retrying in 30 seconds..."
-              sleep 30
-            done
-          }
-          ##Retention settings
-          RETENTION_ENABLED="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.enabled }}"
-          RETENTION_DRY_RUN="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.dryRun }}"
-          FLOW_KEEP_DAYS="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.flow.keepDays }}"
-          FLOW_MAX_VERSIONS="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.flow.maxVersions }}"
-          ARCHIVE_RETENTION_ENABLED="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.archive.enabled }}"
-          ARCHIVE_KEEP_DAYS="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.archive.keepDays }}"
+          # s3sync.py replaces the MinIO `mc` client; credentials resolve via the
+          # boto3 default chain (IRSA) or S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY.
+          S3SYNC=/scripts/s3sync.py
+          export S3_BUCKET S3_ENDPOINT instanceName POD_NAME
 
+          ## Retention settings (consumed by `s3sync.py flow-backup`)
+          export RETENTION_ENABLED="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.enabled }}"
+          export RETENTION_DRY_RUN="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.dryRun }}"
+          export FLOW_KEEP_DAYS="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.flow.keepDays }}"
+          export FLOW_MAX_VERSIONS="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.flow.maxVersions }}"
+          export ARCHIVE_RETENTION_ENABLED="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.archive.enabled }}"
+          export ARCHIVE_KEEP_DAYS="{{ .Values.NiFiSync.s3Sync.flowBackup.retention.archive.keepDays }}"
 
-          # Build + validate the S3 prefix; echo it if valid, return 1 otherwise
-          _backup_prefix() {
-            if [ -z "${S3_BUCKET:-}" ] || [ -z "${instanceName:-}" ] || [ -z "${POD_NAME:-}" ]; then
-              return 1
-            fi
-            # Normalize with trailing slash
-            printf 's3/%s/%s/backup/%s/' "$S3_BUCKET" "$instanceName" "$POD_NAME"
-          }
-
-          # Detect if this mc supports --dry-run on rm
-          _mc_supports_rm_dryrun() {
-            mc --help 2>/dev/null | grep -q -- '--dry-run' || mc rm --help 2>/dev/null | grep -q -- '--dry-run'
-          }
-
-          prune_flow_backups() {
-            [ "${RETENTION_ENABLED:-false}" = "true" ] || return 0
-
-            versions_prefix="$(_backup_prefix)" || { echo "$(date) - [retention] missing S3 vars; skipping."; return 0; }
-
-            echo "$(date) - [retention] Evaluating flow backups in ${versions_prefix%/} (keepDays=$FLOW_KEEP_DAYS, maxVersions=$FLOW_MAX_VERSIONS, dryRun=$RETENTION_DRY_RUN)"
-
-            # If the remote prefix doesn’t exist yet, bail quietly
-            if ! mc --insecure ls "$versions_prefix" >/dev/null 2>&1; then
-              echo "$(date) - [retention] Remote prefix not found; skipping."
-              return 0
-            fi
-
-            # ---- AGE-BASED: delete flow-*.json.gz older than N days
-            if [ -n "${FLOW_KEEP_DAYS:-}" ] && [ "$FLOW_KEEP_DAYS" -gt 0 ] 2>/dev/null; then
-              if [ "$RETENTION_DRY_RUN" = "true" ] && _mc_supports_rm_dryrun; then
-                mc --insecure rm --recursive --force --older-than "${FLOW_KEEP_DAYS}d" --dry-run "${versions_prefix}flow-" || true
-              elif [ "$RETENTION_DRY_RUN" = "true" ]; then
-                # Fallback dry-run: list what would be deleted
-                mc --insecure ls --recursive "$versions_prefix" 2>/dev/null \
-                  | awk '{print $NF}' | grep '^flow-.*\.json\.gz$' \
-                  | while IFS= read -r obj; do
-                      echo "[retention dry-run] would consider $versions_prefix$obj for age-based delete (> ${FLOW_KEEP_DAYS}d)"
-                    done
-              else
-                mc --insecure rm --recursive --force --older-than "${FLOW_KEEP_DAYS}d" "${versions_prefix}flow-" \
-                  | sed 's/^/[retention] /'
-              fi
-            fi
-
-            # ---- COUNT-BASED: keep only newest N versioned flow files
-            if [ -n "${FLOW_MAX_VERSIONS:-}" ] && [ "$FLOW_MAX_VERSIONS" -gt 0 ] 2>/dev/null; then
-              flow_versions="$(mc --insecure ls "$versions_prefix" 2>/dev/null | awk '{print $NF}' | grep '^flow-.*\.json\.gz$' | sort)"
-              total=$(printf '%s\n' "$flow_versions" | grep -c . || true)
-              if [ "$total" -gt "$FLOW_MAX_VERSIONS" ]; then
-                to_delete=$(( total - FLOW_MAX_VERSIONS ))
-                echo "$(date) - [retention] $total versioned flow files; deleting oldest $to_delete to enforce maxVersions=$FLOW_MAX_VERSIONS"
-                i=0
-                printf '%s\n' "$flow_versions" | while IFS= read -r obj; do
-                  [ "$i" -lt "$to_delete" ] || break
-                  full="${versions_prefix}${obj}"
-                  if [ "$RETENTION_DRY_RUN" = "true" ]; then
-                    echo "[retention dry-run] would delete $full"
-                  else
-                    mc --insecure rm "$full" && echo "[retention] deleted $full" || echo "[retention] failed to delete $full"
-                  fi
-                  i=$((i+1))
-                done
-              fi
-            fi
-
-            # Never touch ${versions_prefix}flow.json.gz (the live pointer)
-          }
-
-          prune_remote_archive() {
-            [ "${RETENTION_ENABLED:-false}" = "true" ] || return 0
-            [ "${ARCHIVE_RETENTION_ENABLED:-false}" = "true" ] || return 0
-
-            base="$(_backup_prefix)" || { echo "$(date) - [retention] missing S3 vars; skipping archive."; return 0; }
-            remote_archive="${base}archive/"
-
-            echo "$(date) - [retention] Evaluating archive in ${remote_archive%/} (keepDays=$ARCHIVE_KEEP_DAYS, dryRun=$RETENTION_DRY_RUN)"
-
-            if ! mc --insecure ls "$remote_archive" >/dev/null 2>&1; then
-              echo "$(date) - [retention] Remote archive prefix not found; skipping."
-              return 0
-            fi
-
-            if [ -n "${ARCHIVE_KEEP_DAYS:-}" ] && [ "$ARCHIVE_KEEP_DAYS" -gt 0 ] 2>/dev/null; then
-              if [ "$RETENTION_DRY_RUN" = "true" ] && _mc_supports_rm_dryrun; then
-                mc --insecure rm --recursive --force --older-than "${ARCHIVE_KEEP_DAYS}d" --dry-run "$remote_archive" \
-                  | sed 's/^/[retention dry-run] /'
-              elif [ "$RETENTION_DRY_RUN" = "true" ]; then
-                mc --insecure ls --recursive "$remote_archive" 2>/dev/null \
-                  | awk '{print $NF}' \
-                  | while IFS= read -r obj; do
-                      echo "[retention dry-run] would consider $remote_archive$obj for age-based delete (> ${ARCHIVE_KEEP_DAYS}d)"
-                    done
-              else
-                mc --insecure rm --recursive --force --older-than "${ARCHIVE_KEEP_DAYS}d" "$remote_archive" \
-                  | sed 's/^/[retention] /'
-              fi
-            fi
-          }
-          # Function to back up flow.json.gz and sync archive/
-          backup_nifi_flow() {
-            FLOW_PATH="/opt/nifi/data/flow.json.gz"
-            ARCHIVE_PATH="/opt/nifi/data/archive"
-            BACKUP_PATH="s3/$S3_BUCKET/$instanceName/backup/$POD_NAME"
-            REMOTE_ARCHIVE_PATH="$BACKUP_PATH/archive"
-            TIMESTAMP=$(date +"%Y%m%dT%H%M%S")
-            REMOTE_CURRENT="$BACKUP_PATH/flow.json.gz"
-            REMOTE_VERSIONED="$BACKUP_PATH/flow-backup/$TIMESTAMP-flow.json.gz"
-            REMOTE_HASH_FILE="/tmp/flow_remote_hash"
-
-            # ---------- flow.json.gz upload (only if changed) ----------
-            if [ -f "$FLOW_PATH" ]; then
-              LOCAL_HASH=$(sha256sum "$FLOW_PATH" | awk '{print $1}')
-
-              # Load cached remote hash if available, otherwise compute it once
-              if [ -f "$REMOTE_HASH_FILE" ]; then
-                REMOTE_HASH=$(cat "$REMOTE_HASH_FILE")
-                echo "$(date) - Using cached remote flow.json.gz hash: $REMOTE_HASH"
-              else
-                echo "$(date) - No cached hash found. Checking remote flow.json.gz..."
-                if mc --insecure stat "$REMOTE_CURRENT" >/dev/null 2>&1; then
-                  mc --insecure cp "$REMOTE_CURRENT" /tmp/remote-flow.json.gz && \
-                    REMOTE_HASH=$(sha256sum /tmp/remote-flow.json.gz | awk '{print $1}') && \
-                    echo "$REMOTE_HASH" > "$REMOTE_HASH_FILE"
-                  rm -f /tmp/remote-flow.json.gz
-                else
-                  echo "$(date) - No remote flow.json.gz found. This is the first backup."
-                  REMOTE_HASH=""
-                fi
-              fi
-
-              if [ "$LOCAL_HASH" = "${REMOTE_HASH:-}" ]; then
-                echo "$(date) - No changes detected in flow.json.gz. Skipping flow upload."
-              else
-                # --- archive + upload block ---
-                if [ -n "${REMOTE_HASH:-}" ]; then
-                  echo "$(date) - Changes detected. Archiving previous flow.json.gz to $REMOTE_VERSIONED"
-                  if ! mc --insecure mv "$REMOTE_CURRENT" "$REMOTE_VERSIONED"; then
-                    echo "$(date) - Warning: failed to archive old flow.json.gz (mv). Continuing."
-                  fi
-                else
-                  echo "$(date) - No previous remote flow.json.gz found; this will be the first backup."
-                fi
-
-                echo "$(date) - Uploading updated flow.json.gz to $REMOTE_CURRENT"
-                if mc --insecure cp "$FLOW_PATH" "$REMOTE_CURRENT"; then
-                  echo "$LOCAL_HASH" > "$REMOTE_HASH_FILE"
-                  echo "$(date) - Uploaded flow.json.gz and updated cached remote hash."
-                else
-                  echo "$(date) - Warning: Failed to upload updated flow.json.gz"
-                fi
-                # --- end archive + upload block ---
-              fi
-            else
-              echo "$(date) - flow.json.gz not found. Skipping flow upload."
-            fi
-
-            # ---------- archive/ sync (always) ----------
-            if [ -d "$ARCHIVE_PATH" ]; then
-              echo "$(date) - Syncing NiFi archive directory to $REMOTE_ARCHIVE_PATH"
-              mc --insecure mirror "$ARCHIVE_PATH" "$REMOTE_ARCHIVE_PATH" || \
-                echo "$(date) - Warning: Archive sync failed"
-            else
-              echo "$(date) - Archive path $ARCHIVE_PATH not found. Skipping archive sync."
-            fi
-
-            # ---------- retention (always) ----------
-            prune_flow_backups
-            prune_remote_archive
-          }
-
-          # Function to sync FS paths
-          sync_fs_paths() {
-            {{- range .Values.NiFiSync.syncPaths }}
-            {{- if eq .pathType "fs" }}
-            echo "$(date) - Syncing Remote Path $instanceName/{{ .remotePath }} to {{ .localPath }}"
-
-            if ! mc mirror --exclude ".placeholder" --insecure --overwrite s3/$S3_BUCKET/$instanceName/{{ .remotePath }} {{ .localPath }}; then
-              echo "$(date) - Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
-            fi
-            {{- end }}
-            {{- end }}
-          }
-
-          # Setup mc alias
-          setup_mc_alias
+          # Block until the S3 bucket is reachable (replaces mc alias retry loop)
+          python3 "$S3SYNC" wait-ready
 
           # ---------------- Initial FS Sync Bootstrapping ----------------
           {{- range .Values.NiFiSync.syncPaths }}
           {{- if eq .pathType "fs" }}
-          echo "$(date) - Sync File System Paths with S3. LocalPath: {{ .localPath }} RemotePath: $S3_BUCKET/$instanceName/{{ .remotePath }}"
+          echo "Sync File System Paths with S3. LocalPath: {{ .localPath }} RemotePath: $S3_BUCKET/$instanceName/{{ .remotePath }}"
 
           if [ ! -d "{{ .localPath }}" ]; then
-            echo "$(date) - Creating Local Path: {{ .localPath }}"
+            echo "Creating Local Path: {{ .localPath }}"
             mkdir -p {{ .localPath }}
           fi
 
-          if ! mc --insecure ls s3/$S3_BUCKET/$instanceName/{{ .remotePath }} 2> /dev/null | grep -q "^"; then
-            echo "$(date) - Creating Remote Path $instanceName/{{ .remotePath }} in S3"
-            echo "placeholder" | mc --insecure pipe s3/$S3_BUCKET/$instanceName/{{ .remotePath }}/.placeholder
+          if ! python3 "$S3SYNC" prefix-exists --remote "$instanceName/{{ .remotePath }}"; then
+            echo "Creating Remote Path $instanceName/{{ .remotePath }} in S3"
+            python3 "$S3SYNC" put-placeholder --remote "$instanceName/{{ .remotePath }}"
 
             if [ "$(ls -A {{ .localPath }})" ]; then
-              echo "$(date) - Syncing local data: {{ .localPath }} to S3: $instanceName/{{ .remotePath }}"
-              mc mirror --insecure  {{ .localPath }} --overwrite s3/$S3_BUCKET/$instanceName/{{ .remotePath }} || echo "$(date) - Warning: Initial sync failed for {{ .localPath }}"
+              echo "Syncing local data: {{ .localPath }} to S3: $instanceName/{{ .remotePath }}"
+              python3 "$S3SYNC" mirror-up --local {{ .localPath }} --remote "$instanceName/{{ .remotePath }}" --overwrite || echo "Warning: Initial sync failed for {{ .localPath }}"
             fi
           fi
           {{- end }}
@@ -385,9 +216,9 @@
           {{- if .Values.NiFiSync.s3Sync.flowBackup.enabled }}
           (
             while true; do
-              echo "$(date) - Starting flow backup loop"
-              backup_nifi_flow
-              echo "$(date) - Flow backup complete. Sleeping for {{ .Values.NiFiSync.s3Sync.flowBackup.interval }}."
+              echo "Starting flow backup loop"
+              python3 "$S3SYNC" flow-backup || echo "Warning: flow backup failed"
+              echo "Flow backup complete. Sleeping for {{ .Values.NiFiSync.s3Sync.flowBackup.interval }}."
               sleep {{ .Values.NiFiSync.s3Sync.flowBackup.interval }}
             done
           ) &
@@ -397,9 +228,17 @@
           # ---------------- Start FS Sync Loop ----------------
           (
             while true; do
-              echo "$(date) - Starting file system sync loop"
-              sync_fs_paths
-              echo "$(date) - File sync completed. Sleeping for {{ .Values.NiFiSync.s3Sync.syncInterval }}."
+              echo "Starting file system sync loop"
+              {{- range .Values.NiFiSync.syncPaths }}
+              {{- if eq .pathType "fs" }}
+              {{- $orphans := "dryrun" }}
+              {{- if kindIs "bool" .deleteOrphans }}{{ $orphans = ternary "delete" "off" .deleteOrphans }}{{ else if .deleteOrphans }}{{ $orphans = .deleteOrphans }}{{ end }}
+              {{- if not (has $orphans (list "off" "dryrun" "delete")) }}{{ fail (printf "NiFiSync.syncPaths %q: deleteOrphans must be one of off/dryrun/delete (or true/false); got %v" .pathName .deleteOrphans) }}{{ end }}
+              echo "Syncing Remote Path $instanceName/{{ .remotePath }} to {{ .localPath }}"
+              python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local {{ .localPath }} --exclude .placeholder --overwrite --orphans {{ $orphans }} || echo "Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
+              {{- end }}
+              {{- end }}
+              echo "File sync completed. Sleeping for {{ .Values.NiFiSync.s3Sync.syncInterval }}."
               sleep {{ .Values.NiFiSync.s3Sync.syncInterval }}
             done
           ) &
@@ -431,7 +270,7 @@
           {{- else }}
           name: "custom-data"
           {{- end }}
-        - mountPath: /.mc
-          name: s3config
+        - mountPath: /scripts
+          name: nifisync-scripts
 {{- end }}
 

@@ -97,3 +97,56 @@ NiFiSync:
 ```
 
 To override this behaviour and force a `tls-secret` path to be processed even when ingress is disabled, set `ingress.enabled: true` or use `pathType: generic-secret` instead.
+
+### Disabling the Kubernetes secret-sync Deployment
+
+`NiFiSync.syncPaths` are handled by two different components:
+
+- **`fs` paths** are mirrored by the **s3sync sidecar** that runs inside the NiFi StatefulSet (this sidecar also performs flow backups).
+- **Secret-type paths** (`generic-secret`, `tls-secret`, `ca-secret`) are handled by a separate **`<release>-config-sync` Deployment**, which pulls those paths from S3 and writes them as Kubernetes Secrets — together with the RBAC it needs to do so (a ServiceAccount, Role, RoleBinding, and tokens).
+
+If you only use `fs` paths (or no sync paths at all), the config-sync Deployment and its RBAC are unnecessary. Rendering of the Deployment — and all of its RBAC, the `create-secrets-vault.sh` script, and the synced-secret volume mounts — happens only when **all** of the following are true:
+
+1. `NiFiSync.s3Sync.enabled: true`
+2. `NiFiSync.s3Sync.secretSync.enabled: true` (the default)
+3. at least one **enabled** `syncPath` has a `pathType` other than `fs`
+
+```yaml
+NiFiSync:
+  s3Sync:
+    enabled: true
+    secretSync:
+      enabled: false   # keep fs sync + flow backup, but never sync K8s secrets
+```
+
+Behaviour:
+
+- **Auto-skip:** if there are no enabled non-`fs` paths, the Deployment, its RBAC, the `create-secrets-vault.sh` script, and the per-path secret volumes are simply not created — no orphaned ServiceAccounts/Roles/tokens are left behind. No toggle change is required.
+- **Explicit off-switch:** set `secretSync.enabled: false` to disable secret syncing even when secret-type paths are still listed in `syncPaths`. The fs-sync sidecar and flow backup on the StatefulSet keep running. The synced-secret volume mounts are dropped from the NiFi and cert-manager containers at the same time, so pods still start cleanly (they just won't have those secrets mounted).
+
+### Pruning local files removed from S3 (`deleteOrphans`)
+
+For `fs` paths, an optional `deleteOrphans` field controls whether local files that no longer exist in S3 are removed (similar to `mc mirror --remove`):
+
+| Value | Behaviour |
+|---|---|
+| `"dryrun"` *(default)* | Logs which local files **would** be removed, without deleting anything. |
+| `"delete"` | Removes local files that are not present in S3. |
+| `"off"` | Never prunes. |
+
+Booleans are also accepted (`true` = `delete`, `false` = `off`). For safety, pruning is **always skipped** when S3 is unreachable or the remote prefix returns no objects, so the local folder is never wiped by an outage or a misconfigured bucket/prefix.
+
+```yaml
+NiFiSync:
+  syncPaths:
+    - pathName: custom-drivers
+      pathType: fs
+      localPath: /opt/nifi/data/custom/drivers
+      remotePath: custom/drivers
+      deleteOrphans: "off"      # in-use jars; don't prune
+    - pathName: custom-config
+      pathType: fs
+      localPath: /opt/nifi/data/custom/config
+      remotePath: custom/config
+      deleteOrphans: "delete"   # mirror this path exactly
+```

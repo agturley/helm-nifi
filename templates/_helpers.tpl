@@ -206,6 +206,31 @@ none
 {{- end -}}
 
 {{/*
+nifi.secretSyncEnabled
+Returns "true" when the S3 -> Kubernetes secret-sync (the config-sync
+Deployment, its RBAC, and the synced-secret volumes) should be rendered:
+  s3Sync.enabled                                  AND
+  s3Sync.secretSync.enabled (default true)        AND
+  at least one enabled syncPath has pathType != fs
+The non-fs check makes the Deployment auto-skip when there are no secrets to
+sync; the toggle is the explicit off-switch. Returns "" otherwise.
+*/}}
+{{- define "nifi.secretSyncEnabled" -}}
+{{- $ns := .Values.NiFiSync -}}
+{{- $s3 := $ns.s3Sync -}}
+{{- $ss := $s3.secretSync | default dict -}}
+{{- $toggle := true -}}
+{{- if hasKey $ss "enabled" -}}{{- $toggle = $ss.enabled -}}{{- end -}}
+{{- $hasSecretPath := false -}}
+{{- range $ns.syncPaths -}}
+{{- if and (default true .enabled) (ne .pathType "fs") -}}
+{{- $hasSecretPath = true -}}
+{{- end -}}
+{{- end -}}
+{{- if and $s3.enabled $toggle $hasSecretPath -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 nifi.secretsInit
 Emits a shell block that normalises runtime secrets into a consistent set of
 environment variables at container startup.  All subsequent script logic can

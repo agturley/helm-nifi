@@ -559,20 +559,18 @@
             readOnly: true
       {{- end }}
 
-    {{- if .Values.NiFiSync.s3Sync.enabled}}
+    {{- if eq (include "nifi.secretSyncEnabled" $) "true" }}
         {{- range .Values.NiFiSync.syncPaths }}
         {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
             mountPath: {{ .localPath }}
         {{- end }}
         {{- end }}
-    {{- /* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}
+    {{- /* if nifi.secretSyncEnabled */}}{{ end }}
     {{- if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled}}
           - mountPath: /opt/nifi/nifi-sync/scripts
             name: nifisync-scripts
-    {{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}    
-          - mountPath: /.mc
-            name: s3config
+    {{- /* if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled */}}{{ end }}
           - mountPath: /opt/nifi/nifi-current/logs
             {{- if and .Values.persistence.enabled .Values.persistence.subPath.enabled (not .Values.persistence.logStorage.DisallowSubPath) }}
             name: {{ .Values.persistence.subPath.name }}
