@@ -54,6 +54,24 @@ Define is cluster is using http or https
 {{- if .Values.certManager.nodeOU -}}, OU={{ .Values.certManager.nodeOU }}{{- end -}}
 {{- end -}}
 
+{{/*
+issuerRef body for cert-manager Certificate resources.
+When certManager.issuerRef.name is set, reference that existing
+Issuer/ClusterIssuer; otherwise reference the chart-managed CA Issuer.
+Call with the root context ($).
+*/}}
+{{- define "apache-nifi.certManagerIssuerRef" -}}
+{{- $ext := default (dict) .Values.certManager.issuerRef -}}
+{{- if ne (default "" $ext.name) "" -}}
+name: {{ $ext.name }}
+kind: {{ default "ClusterIssuer" $ext.kind }}
+group: {{ default "cert-manager.io" $ext.group }}
+{{- else -}}
+name: {{ template "apache-nifi.fullname" . }}-ca
+kind: Issuer
+{{- end -}}
+{{- end -}}
+
 {{- define "nifi.ingress.scheme" -}}
 {{- if and .Values.ingress.tls (gt (len .Values.ingress.tls) 0) -}}
 https
