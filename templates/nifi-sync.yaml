@@ -503,7 +503,7 @@ data:
                 logging.info(f"Removed user '{usr}' ({uid}) from users.xml")
 
             # 2) Remove them from any <group> memberships
-            for grp_el in groups_elem.findall("group"):
+            for grp_el in (groups_elem.findall("group") if groups_elem is not None else []):
                 member_el = grp_el.find(f"./user[@identifier='{uid}']")
                 if member_el is not None:
                     grp_el.remove(member_el)
