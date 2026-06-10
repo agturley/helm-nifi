@@ -177,13 +177,13 @@
             {{ range untilStep 0 (int .Values.replicaCount) 1 }}
                       xmlstarlet ed --inplace \
                                     --subnode "authorizers/accessPolicyProvider" --type 'elem' -n 'property' \
-                                    --value "CN={{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}{{ include "nifi.nodeOU" $ }}" \
+                                    --value "CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" .) }}{{ include "nifi.nodeOU" $ }}" \
                                     --insert "authorizers/accessPolicyProvider/property[not(@name)]" --type attr -n name \
                                     --value "Node Identity {{ . }}" \
                                     "${NIFI_HOME}/conf/authorizers.xml"
                       xmlstarlet ed --inplace \
                                     --subnode "authorizers/userGroupProvider" --type 'elem' -n 'property' \
-                                    --value "CN={{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}{{ include "nifi.nodeOU" $ }}" \
+                                    --value "CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" .) }}{{ include "nifi.nodeOU" $ }}" \
                                     --insert "authorizers/userGroupProvider/property[not(@name)]" --type attr -n name \
                                     --value "Initial User Identity {{ . }}" \
                                     "${NIFI_HOME}/conf/authorizers.xml"
@@ -222,13 +222,13 @@
 {{ range untilStep 0 (int .Values.replicaCount) 1 }}
           xmlstarlet ed --inplace \
                         --subnode "authorizers/accessPolicyProvider" --type 'elem' -n 'property' \
-                          --value "CN={{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}{{ include "nifi.nodeOU" $ }}" \
+                          --value "CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" .) }}{{ include "nifi.nodeOU" $ }}" \
                         --insert "authorizers/accessPolicyProvider/property[not(@name)]" --type attr -n name \
                           --value "Node Identity {{ . }}" \
                         "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace \
                         --subnode "authorizers/userGroupProvider" --type 'elem' -n 'property' \
-                          --value "CN={{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}{{ include "nifi.nodeOU" $ }}" \
+                          --value "CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" .) }}{{ include "nifi.nodeOU" $ }}" \
                         --insert "authorizers/userGroupProvider/property[not(@name)]" --type attr -n name \
                           --value "Initial User Identity {{ . }}" \
                         "${NIFI_HOME}/conf/authorizers.xml"
