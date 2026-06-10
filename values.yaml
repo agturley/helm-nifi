@@ -759,6 +759,21 @@ certManager:
   # permissions are not available in AWS). The sidecar and RBAC resources are
   # still created so the sidecar can read the pre-provisioned secrets.
   manageCerts: true
+  # Reference an existing cert-manager Issuer/ClusterIssuer instead of having the
+  # chart create its own self-signed CA chain. When issuerRef.name is non-empty,
+  # the chart skips creating the self-signed Issuer, CA Certificate, and CA Issuer,
+  # and points the per-node (and monitor) Certificates at this issuer instead.
+  # Requires manageCerts: true (the chart still creates the per-node Certificate
+  # resources; only the signer changes).
+  #
+  # Use a CA-based issuer (CA/Vault/Venafi) so cert-manager populates ca.crt in each
+  # node secret, which the sidecar imports into the inter-node mTLS truststore. For
+  # ACME issuers (e.g. Let's Encrypt) ca.crt may be empty; supply trust roots via
+  # certManager.caSecrets in that case.
+  issuerRef:
+    name: ""
+    kind: ClusterIssuer
+    group: cert-manager.io
   clusterDomain: cluster.local
   keystorePasswd: "keystorePasswd" #changeme_secret
   truststorePasswd: "truststorePasswd" #changeme_secret

@@ -1,5 +1,7 @@
 {{ if .Values.certManager.enabled }}
+{{- $useExtIssuer := ne (default "" (default (dict) .Values.certManager.issuerRef).name) "" -}}
 {{- if .Values.certManager.manageCerts }}
+{{- if not $useExtIssuer }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Issuer
@@ -40,6 +42,7 @@ metadata:
 spec:
   ca:
     secretName: {{ template "apache-nifi.fullname" $ }}-ca
+{{- /* if not $useExtIssuer */}}{{ end }}
 ---
 {{ range untilStep 0 (int .Values.replicaCount) 1 }}
 apiVersion: cert-manager.io/v1
@@ -71,8 +74,7 @@ spec:
     - {{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc
     - {{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}
   issuerRef:
-    name: {{ template "apache-nifi.fullname" $ }}-ca
-    kind: Issuer
+{{ include "apache-nifi.certManagerIssuerRef" $ | indent 4 }}
 ---
 {{/* range untilStep 0 (int .Values.replicaCount ) 1 */}}{{ end }}
 {{/* if not .Values.certManager.manageCerts */}}{{ end }}
@@ -185,8 +187,7 @@ spec:
     - {{ template "apache-nifi.fullname" $ }}-monitor.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc
     - {{ template "apache-nifi.fullname" $ }}-monitor.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}
   issuerRef:
-    name: {{ template "apache-nifi.fullname" $ }}-ca
-    kind: Issuer
+{{ include "apache-nifi.certManagerIssuerRef" $ | indent 4 }}
 ---
 {{/* if .Values.metrics.prometheus.serviceMonitor.enabled */}}{{ end }}
 {{/* if .Values.certManager.enabled */}}{{ end }}
