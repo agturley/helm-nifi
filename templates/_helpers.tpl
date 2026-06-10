@@ -55,6 +55,19 @@ Define is cluster is using http or https
 {{- end -}}
 
 {{/*
+Per-node certificate Common Name, also used as the NiFi cluster node identity.
+Kept short (pod name only) to stay within the X.509 CN 64-character limit. The
+full headless FQDN is still carried in the certificate SANs (dnsNames) for TLS
+hostname verification, so this does not affect node-to-node TLS validation.
+This value MUST stay identical between the per-node Certificate's commonName and
+the Node/User Identity entries in authorizers.xml, so both call this helper.
+Call with a dict: (dict "ctx" $ "node" <index>).
+*/}}
+{{- define "nifi.nodeCN" -}}
+{{ include "apache-nifi.fullname" .ctx }}-{{ .node }}
+{{- end -}}
+
+{{/*
 issuerRef body for cert-manager Certificate resources.
 When certManager.issuerRef.name is set, reference that existing
 Issuer/ClusterIssuer; otherwise reference the chart-managed CA Issuer.

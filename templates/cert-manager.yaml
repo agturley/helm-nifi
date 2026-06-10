@@ -52,7 +52,7 @@ metadata:
   namespace: {{ $.Release.Namespace }}
 spec:
   duration: {{ $.Values.certManager.certDuration }}
-  commonName: {{ template "apache-nifi.fullname" $ }}-{{ . }}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}
+  commonName: {{ include "nifi.nodeCN" (dict "ctx" $ "node" .) }}
   subject:
     organizationalUnits:
     - NIFI

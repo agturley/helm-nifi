@@ -56,7 +56,7 @@ data:
     ENABLE_MANAGED_GROUPS = os.getenv("ENABLE_MANAGED_GROUPS", "true").lower() in ("1", "true", "yes")
     MONITORING_USER = 'CN={{ template "apache-nifi.fullname" $ }}-monitor{{ include "nifi.nodeOU" $ }}'
     REPLICA_COUNT = {{ .Values.replicaCount }}
-    NODE_USER_TEMPLATE = 'CN={{ template "apache-nifi.fullname" $ }}-{i}.{{ template "apache-nifi.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}{{ include "nifi.nodeOU" $ }}'
+    NODE_USER_TEMPLATE = 'CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" "{i}") }}{{ include "nifi.nodeOU" $ }}'
 
     # Namespace for deterministic UUID5
     default_namespace = uuid.uuid5(uuid.NAMESPACE_DNS, "nifi-sync")
@@ -503,7 +503,7 @@ data:
                 logging.info(f"Removed user '{usr}' ({uid}) from users.xml")
 
             # 2) Remove them from any <group> memberships
-            for grp_el in groups_elem.findall("group"):
+            for grp_el in (groups_elem.findall("group") if groups_elem is not None else []):
                 member_el = grp_el.find(f"./user[@identifier='{uid}']")
                 if member_el is not None:
                     grp_el.remove(member_el)
