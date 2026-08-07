@@ -78,7 +78,7 @@
         <property name="TLS - Protocol">TLS</property>
         <property name="TLS - Shutdown Gracefully">false</property>
 
-        <property name="Referral Strategy">FOLLOW</property>
+        <property name="Referral Strategy">{{.Values.auth.ldap.referralStrategy}}</property>
         <property name="Connect Timeout">10 secs</property>
         <property name="Read Timeout">10 secs</property>
         <property name="Url">{{.Values.auth.ldap.host}}</property>

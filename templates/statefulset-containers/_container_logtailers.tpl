@@ -1,7 +1,7 @@
 {{- define "nifi.container.logTailers" }}
       - name: app-log
-        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
-        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        imagePullPolicy: {{ .Values.images.sidecar.pullPolicy | default "Always" | quote }}
+        image: "{{ .Values.images.sidecar.repository }}:{{ .Values.images.sidecar.tag }}"
         args: 
           - /bin/sh
           - -c
@@ -17,8 +17,8 @@
           name: "logs"
           {{- end }}
       - name: bootstrap-log
-        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
-        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        imagePullPolicy: {{ .Values.images.sidecar.pullPolicy | default "Always" | quote }}
+        image: "{{ .Values.images.sidecar.repository }}:{{ .Values.images.sidecar.tag }}"
         args:
           - /bin/sh
           - -c
@@ -34,8 +34,8 @@
           name: "logs"
           {{- end }}
       - name: user-log
-        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
-        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        imagePullPolicy: {{ .Values.images.sidecar.pullPolicy | default "Always" | quote }}
+        image: "{{ .Values.images.sidecar.repository }}:{{ .Values.images.sidecar.tag }}"
         args:
           - /bin/sh
           - -c

@@ -18,16 +18,43 @@ labels:
   region: ""
   owner: ""
 
-image:
-  repository: apache/nifi
-  tag: "2.9.0"
-  pullPolicy: "IfNotPresent"
+# Shared Kubernetes Secret names that contain CA certificate files (.crt/.cer/.pem).
+# The chart mounts these secrets into both the NiFi truststore builder and the
+# Vault sidecar so they trust the same CA bundle.
+# For the Vault sidecar, all matching cert files in the selected secret are
+# concatenated into one bundle before Vault authentication starts.
+# Primary setting for shared CA bundles; legacy certManager.caSecrets remains
+# supported as a fallback for older values files.
+caSecrets: []
 
-  ## Optionally specify an imagePullSecret.
-  ## Secret must be manually created in the namespace.
-  ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
-  ##
-  # pullSecret: myRegistrKeySecretName_secret
+# All container images used by the chart are defined here.
+# Feature-specific images (VaultNiFiSecrets.vaultSidecar) remain
+# under their own sections since they are independently versioned.
+images:
+  # Main Apache NiFi application image
+  nifi:
+    repository: apache/nifi
+    tag: "2.11.0"
+    pullPolicy: "IfNotPresent"
+    ## Optionally specify an imagePullSecret.
+    ## Secret must be manually created in the namespace.
+    ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+    ##
+    # pullSecret: myRegistrKeySecretName_secret
+
+
+  # Utility image for init containers and misc operational tasks (CA bundle prep,
+  # s3-secret-sync, etc.). Must include a POSIX shell, python3, and boto3.
+  utility:
+    repository: docker.io/agturley/nifi-utility
+    tag: "v1"
+    pullPolicy: "IfNotPresent"
+
+  # Lightweight sidecar image for log tailers and zookeeper connectivity checks
+  sidecar:
+    repository: busybox
+    tag: "1.37.0"
+    pullPolicy: "IfNotPresent"
 
 #securityContext:
 #  runAsUser: 1000
@@ -41,19 +68,6 @@ image:
 ## WARNING: Make sure that hosts using this are properly firewalled otherwise
 ## metrics and traces are accepted from any host able to connect to this host.
 #
-
-#Legacy Hashicorp settings######
-hashicorp:
-  enabled: false
-  vaultUri: http://vault.vault.svc:8200
-  vaultKvPath: nifi-kv
-  vaultKvVersion: 2
-  vaultAuthentication: TOKEN
-  vaultToken: root
-  vaultAuthenticationPropertiesFile:
-  vaultConnectionTimeout: 5 secs
-  vaultReadTimeout: 15 secs
-
 
 sts:
   # Parallel podManagementPolicy for faster bootstrap and teardown. Default is OrderedReady.
@@ -106,28 +120,25 @@ properties:
   #                 (certManager.*Passwd, auth.ldap.pass, properties.sensitiveKey, …).
   #                 Use only for non-production / demo deployments.
   #
-  #   file-dir    – each credential is a separate file inside secretsFilePath/,
+  #   directory   – each credential is a separate file inside secretsFilePath/,
   #                 named after its key (e.g. NIFI_TLS_KEYSTORE_PASSWORD).
   #                 Compatible with K8s Secrets projected as individual files,
   #                 VSO secret-operator, awsSecretsSync sidecar, etc.
   #
-  #   file-single – all credentials live in one KEY=VALUE (.env) file located at
+  #   singlefile  – all credentials live in one KEY=VALUE (.env) file located at
   #                 secretsFilePath/secretsFile.  The file is sourced with
   #                 `set -a; . FILE; set +a` at container startup.
-  #
-  #   env         – credentials arrive as environment variables already set on the
-  #                 container (e.g. via env[] or envFrom[] referencing a K8s Secret).
-  #                 No file reads are performed.
   #
   # NOTE: when certManager.useMergedCACerts=true, bootstrap.conf JVM truststore
   # args (java.arg.100-102) are rendered by Helm, then the server startup script
   # rewrites java.arg.102 to use runtime NIFI_TLS_TRUSTSTORE_PASSWORD.
   #
-  # UseK8sSecrets is deprecated (2.8.0); use secretsMode: file-dir instead.
-  secretsMode: ""         # none | file-dir | file-single | env  (empty = legacy UseK8sSecrets)
-  secretsFile: "credentials.env"  # filename within secretsFilePath for file-single mode
+  # UseK8sSecrets was removed in 2.10; use secretsMode: directory instead.
+  # Legacy aliases file-dir and file-single are still accepted, but will be removed in a future release.
+  secretsMode: ""         # none | directory | singlefile
+  secretsFile: "credentials.env"  # filename within secretsFilePath for singlefile mode
   #
-  # secretsFilePath: base directory for file-dir and file-single modes.
+  # secretsFilePath: base directory for directory and singlefile modes.
   # secretsName (optional): name of a Kubernetes Secret to project into secretsFilePath;
   #   leave empty when files are written by a sidecar.
   secretsName: ""
@@ -172,8 +183,10 @@ properties:
   flowArchiveMaxTime: "30 days"
   flowArchiveMaxStorage: "500 MB"
   flowAutoResumeState: true
-  autoloadLibPath: "./extensions"
   flowRegistrySyncInterval: "1 hour"
+  autoloadLibPath: "./extensions"
+  pythonExtensionsSourceDir: "./python/extensions"
+
   # kerberosKrb5Path: /opt/nifi/data/custom/security/krb5.conf
   siteToSite:
     port: 10000
@@ -188,7 +201,7 @@ properties:
 
 jvm:
   heapSize: "8g"
-  gcCollector: "g1gc"      # Options: zgc, g1gc
+  gcCollector: "g1gc"
   gcLogging:
     enabled: true
     path: "/opt/nifi/nifi-current/logs/gc.log"
@@ -217,7 +230,7 @@ jvm:
     alwaysPreTouch: true
     extraArgs: []
 
-Logging:
+clusterLogging:
   enabled: false
   clusterOutput:
   kubernetesDnsServer:
@@ -234,19 +247,46 @@ logging:
   extraLoggers: []
 
 VaultNiFiSecrets:
-  secretProvider: vaultSecretOperator  #vaultSidecar  
+  # Vault Sidecar Secret Sync Service
+  # 
+  # Fetches secrets from HashiCorp Vault (KV v1/v2) using Kubernetes service-account 
+  # authentication and writes them to the pod's filesystem in multiple output formats:
+  #   - directory:      Each secret key becomes a separate file
+  #   - singlefile:     All secret keys as KEY=VALUE lines in one file
+  #   - aws-credential: AWS credentials in INI (~/.aws/credentials) or JSON format
+  #
+  # When enabled, a Python FastAPI sidecar container runs in the NiFi pod and periodically
+  # fetches secrets from Vault, formats them, and writes them to the container filesystem.
+  # The main NiFi application can then read these files at runtime.
+  #
+  # Key Features:
+  #   - Case-insensitive AWS field mapping (AWS_ACCESS_KEY_ID, access_key, etc.)
+  #   - TTL-to-ISO 8601 expiration timestamp conversion for credential_process compatibility
+  #   - Discovery files for applications to locate credentials and metadata
+  #   - Atomic file writes with secure permissions (0600 for files, 0700 for dirs)
+  #   - Per-secret KV version override (1 or 2)
+  #   - Custom output path and filename overrides
+  #   - Base64 encoding support for binary secrets
+  #
+  secretProvider: vaultSidecar  # Chart-owned Python sidecar (uses K8s service account auth)
   enabled: false
-  defaultSecretAddress: ""         
-  defaultAuthPath:           #"e1rke400-e1-poc2000"
-  defaultMount:              #"e1rke400-e1-poc2000"
-  defaultNamespace:          #"tra/tra-e1"
-  defaultRole:               #'role-e1rke400-e1-poc2000'
-  defaultPath:               #"nifi/traarchival01"
+  # Vault server URL. Will be set by converter tool if not specified.
   defaultContainerPath: /opt/nifi/secrets
-  defaultSecretMode: directory
-  logLevel: INFO
-  vaultSidecarImage: ""  # Required: set to your vault sidecar image when secretProvider=vaultSidecar
+  defaultSecretAddress: ""
+  # Default Vault KV engine version for sidecar reads (1 or 2).
+  # Can be overridden per secret with secrets[].kvVersion.
+  defaultKvVersion: 2
+  # Default secret output mode for Vault sidecar (directory|file|aws-credential).
+  # Can be overridden per secret with secrets[].secretMode.
+  defaultSecretMode: "directory"
   vaultSidecar:
+    image: ""
+    installPackages: false
+    skipTlsVerify: false
+    # Optional Vault-specific CA secret override. If empty, the chart uses the
+    # first top-level caSecrets entry and builds a bundle from every .crt/.cer/.pem
+    # file in that secret.
+    caSecretName: ""
     logging: false
     restproxy_url: ""  # Set to your Kafka REST proxy URL for vault sidecar logging
     topic: 'vault-logs'
@@ -254,11 +294,66 @@ VaultNiFiSecrets:
     syncInterval: 10 #minutes
   secrets:            # List of additional secrets to fetch from Vault
     - name: nifi-secrets
-    #- name: example-secret                 #Name of secret in vault
-    #  mount: othermount                    #Override default vault mount for this secret only  
-    #  path: other/path                     #path to secret in vault
-    #  containerPath: "/opt/nifi/custom"    #Override default container path for this secret only
-    #  secretMode: env                      #Override default secret mode for this secret only (env|file|directory)
+    #  kvVersion: 1                      # Optional per-secret override for KV engine version (1|2)
+    #                                    # aws-credential defaults to kvVersion=1 when omitted
+    #
+    # Supported secretMode values: directory | singlefile | aws-credential
+    #
+    # Example 1: Directory mode (each secret key becomes a separate file)
+    #- name: db-credentials
+    #  mount: secret
+    #  path: nifi/database
+    #  secretMode: directory              # Creates /opt/nifi/secrets/db-credentials/
+    #  outputFile: db-credentials         #   - user
+    #  kvVersion: 2                       #   - password
+    #                                     #   - host
+    #
+    # Example 2: Single file mode (KEY=VALUE lines in one file)
+    #- name: app-config
+    #  mount: secret
+    #  path: nifi/config
+    #  secretMode: singlefile             # Creates /opt/nifi/secrets/app-config
+    #  outputFile: app-config             # Contents: KEY1=value1\nKEY2=value2\n...
+    #  kvVersion: 2
+    #
+    # Example 3: AWS credentials in INI format (~/.aws/credentials style)
+    #- name: aws-trasiemd00
+    #  mount: aws
+    #  path: sts
+    #  secretMode: aws-credential
+    #  outputFile: aws-trasiemd00-credentials  # Prevents collision with directory mode
+    #  kvVersion: 1
+    #  # Expects Vault secret keys: aws_access_key_id, aws_secret_access_key,
+    #  # aws_session_token (optional), aws_region (optional), ttl (optional)
+    #  # Output: [default]\naws_access_key_id=...\naws_secret_access_key=...\n...
+    #
+    # Example 4: AWS credentials in JSON format (credential_process compatible)
+    #- name: aws-json-creds
+    #  mount: aws
+    #  path: sts
+    #  secretMode: aws-credential
+    #  outputFile: aws-creds.json
+    #  awsCredentialFormat: json          # "credential" for INI (default), "json" for credential_process
+    #  kvVersion: 1
+    #  # Output: {"Version": 1, "AccessKeyId": "...", "SecretAccessKey": "...", "SessionToken": "..."}
+    #
+    # Example 5: Custom container path override
+    #- name: tls-certs
+    #  mount: secret
+    #  path: nifi/tls
+    #  secretMode: directory
+    #  outputFile: tls
+    #  containerPath: /custom/tls/path    # Overrides defaultContainerPath for this secret
+    #  kvVersion: 2
+    #
+    # Example 6: Base64 encoded output
+    #- name: binary-secret
+    #  mount: secret
+    #  path: nifi/binary
+    #  secretMode: singlefile
+    #  outputFile: binary-data
+    #  format: base64                     # Encodes all values as base64
+    #  kvVersion: 2
 
 # AWS Secrets Manager sidecar
 # When enabled, a Python sidecar fetches secrets from AWS Secrets Manager and
@@ -276,11 +371,6 @@ awsSecretsSync:
   syncMode: interval
   syncInterval: 10   # minutes; only used when syncMode=interval
   logLevel: INFO
-  image:
-    repository: python
-    tag: "3.12-slim"
-    pullPolicy: IfNotPresent
-    # pullSecret: myRegistrySecret
   # Set installPackages: false when using a pre-built image that already
   # includes boto3 and pyyaml (required in air-gapped / no-internet envs).
   installPackages: true
@@ -320,6 +410,7 @@ NiFiSync:
     path: #"nifi/<clustername>"
     mount: #"e1rke400-e1-poc2000"
   DefaultSecretType: kubernetes #Global secret type: 'kubernetes' or 'vault' (vault NifiSync.Vault must be enalbed to use 'vault')
+
   syncPaths:
     # Each path supports an optional 'enabled' field (default: true).
     # Set 'enabled: false' to skip a path without removing it from the config.
@@ -333,6 +424,14 @@ NiFiSync:
     # ALWAYS skipped when S3 is unreachable or the remote prefix returns no
     # objects, so the local folder is never wiped by an outage or a
     # misconfigured bucket/prefix.
+    #
+    # An optional 'remoteRoot' field overrides the per-cluster instanceName as
+    # the top-level S3 folder for that path.  Use it for shared prefixes that
+    # multiple clusters read from the same bucket:
+    #   (default, no remoteRoot)  s3://<bucket>/<embedded-prefix>/<instanceName>/<remotePath>
+    #   remoteRoot: enrichment    s3://<bucket>/<embedded-prefix>/enrichment/<remotePath>
+    # This is read-only from the sidecar perspective — no placeholder is written
+    # and the path is never uploaded, only mirrored down.
     - pathName: custom-drivers
       localPath: /opt/nifi/data/custom/drivers
       remotePath: custom/drivers
@@ -342,6 +441,10 @@ NiFiSync:
       localPath: /opt/nifi/data/custom/extensions
       remotePath: custom/extensions
       pathType: fs
+    - pathName: custom-python-extensions
+      localPath: /opt/nifi/data/custom/python-extensions
+      remotePath: custom/python-extensions
+      pathType: fs      
     - pathName: custom-security
       localPath: /opt/nifi/data/custom/security
       remotePath: custom/secuirty
@@ -362,8 +465,21 @@ NiFiSync:
       remotePath: system/cas
       pathType: ca-secret
 
+  # additionalSyncPaths: add extra entries in your override values.yaml without
+  # overwriting the chart defaults in syncPaths above.  Supports all the same
+  # fields (pathName, localPath, remotePath, pathType, remoteRoot, deleteOrphans, enabled).
+  # Example:
+  #   additionalSyncPaths:
+  #     - pathName: enrichment-data
+  #       localPath: /opt/nifi/data/enrichment
+  #       remotePath: data
+  #       pathType: fs
+  #       remoteRoot: enrichment
+  #       deleteOrphans: "dryrun"
+  additionalSyncPaths: []
+
   s3Sync:
-    enable: false
+    enabled: false
     syncInterval: 1d
     # secretSync controls the separate "config-sync" Deployment that pulls the
     # non-fs syncPaths (generic-secret/tls-secret/ca-secret) from S3 and writes
@@ -399,7 +515,8 @@ NiFiSync:
     sidecar:
       # The sidecar image must bundle python3 + boto3 (the sync logic now uses
       # boto3 instead of the MinIO `mc` client). pyyaml is not required.
-      image: docker.io/agturley/nifi-utility:v1
+      # Defaults to utilityImage.image if not overridden.
+      image: ""
     flowBackup:
       enabled: true
       interval: 1d
@@ -412,6 +529,14 @@ NiFiSync:
         archive:
           enabled: true       # enable if you also want remote archive/ pruned
           keepDays: 30         # delete archive/ objects older than X days
+    # overwrite: when true, mirror-down always replaces local files regardless of
+    # whether they match what is in S3. When false (the default), a local file is
+    # skipped if it already exists and its size matches the S3 object — it is
+    # still replaced when the sizes differ (i.e. the file was updated in S3).
+    overwrite: false
+    flowRestore:
+      enabled: false
+      intervalMinutes: 1      # minutes between S3 restore-trigger polls
 
   UserPolicySync:
     enabled: false
@@ -459,7 +584,7 @@ NiFiSync:
 # Nifi User Authentication
 auth:
   # If set while LDAP is enabled, this value will be used for the initial admin and not the ldap bind dn / admin
-  admin: CN=admin
+  admin: CN=admin, OU=NIFI
   SSL:
     keystorePasswd: "keystorePasswd" #changeMe_secret
     truststorePasswd: "truststorePasswd" #changeMe_secret
@@ -493,7 +618,18 @@ auth:
     groupUserIdentityAttribute: sAMAccountName
     groupNameAttribute: sAMAccountName
     groupMemberAttribute: member
-    groupMemberAttributeReferencedUser: distinguishedName   
+    groupMemberAttributeReferencedUser: distinguishedName
+    # Optional second LDAP user search base for an additional OU (e.g. service accounts, contractors).
+    # When set, a second LdapUserGroupProvider is added to the composite provider so NiFi
+    # can resolve identities from both OUs. Use this when a single searchBase is insufficient
+    # and referrals or a root-DC search are not available.
+    # Note: login (LdapProvider) still uses searchBase above — this is authorization resolution only.
+    secondaryUserSearchBase: "" # e.g. OU=ServiceAccounts,DC=ldap,DC=example,DC=be
+    secondaryUserSearchScope: ONE_LEVEL
+    secondaryUserSearchFilter: (objectClass=*)
+    secondaryGroupSearchBase: "" # leave empty to skip group search on the secondary OU
+    secondaryGroupSearchScope: ONE_LEVEL
+    secondaryGroupSearchFilter: (objectClass=*)
 
 
   oidc:
@@ -506,6 +642,25 @@ auth:
     preferredJwsAlgorithm:
     ## Request additional scopes, for example profile
     additionalScopes:
+
+  # Node identity mapping for NiFi authorization.
+  # Use this to map per-pod mTLS identities (for example CN=<release>-0, CN=<release>-1)
+  # to one shared identity so proxy/user policies do not need per-ordinal updates.
+  # This simplifies cluster expansion: add new nodes without re-authorizing each node's
+  # individual certificate CN. All nodes normalize to one shared identity in NiFi policies.
+  nodeIdentity:
+    shared:
+      # Enable shared-node identity mapping in nifi.properties and policy sync.
+      enabled: false
+      # Shared node identity string (CN only, do not include "CN=").
+      # When set, this exact value is used as the NiFi node identity in
+      # authorizers.xml and nifi.properties identity mapping.
+      # If empty, the identity is auto-generated as <namespace>-<release>[.<identityDomain>].
+      identity: ""
+      # Optional domain suffix appended to the auto-generated identity.
+      # e.g. set to "cluster.local" to produce "<namespace>-<release>.cluster.local".
+      # Has no effect when identity is set explicitly.
+      identityDomain: ""
 
 ## Expose the nifi service to be accessed from outside the cluster (LoadBalancer service).
 ## or access it from within the cluster (ClusterIP service). Set the service type and the port to serve it.
@@ -573,11 +728,19 @@ ingress:
   path: /
   # If you want to change the default path, see this issue https://github.com/cetic/helm-nifi/issues/22
 
+# Utility image used for init containers and misc operational tasks (CA bundle prep, etc.).
+# Must have a POSIX shell and standard coreutils.
+# DEPRECATED: use images.utility instead. Retained for backwards compatibility.
+utilityImage:
+  image: ""
+  imagePullPolicy: ""
+
 # Separate image for tailing each log separately and checking zookeeper connectivity
+# DEPRECATED: use images.sidecar instead. Retained for backwards compatibility.
 sidecar:
-  image: busybox
-  tag: "1.37.0"
-  imagePullPolicy: "IfNotPresent"
+  image: ""
+  tag: ""
+  imagePullPolicy: ""
 
 ## Enable persistence using Persistent Volume Claims
 ## ref: http://kubernetes.io/docs/user-guide/persistent-volumes/
@@ -725,7 +888,7 @@ env: []
 ## Extra environment variables from secrets and config maps
 envFrom: []
 
-## Extra options to add to the bootstrap.conf file
+## Extra options to add to the bootstrap.conf file (optional, advanced use only)
 extraOptions: []
 
 # envFrom:
@@ -787,16 +950,14 @@ certManager:
   # Source password of jvmCACertsPath/auto-detected JVM cacerts before re-keying.
   jvmCACertsStorePasswd: "changeit"
   replaceDefaultTrustStore: false
-  # List of Kubernetes secret names whose certificate files (.crt, .cer, .pem)
-  # will be imported into the NiFi truststore at pod startup. Each secret is
-  # mounted at /opt/nifi/nifi-current/tls/<secret-name>/. Useful for adding
-  # LDAP server CAs or other internal CAs not covered by the cluster issuer.
+  # Legacy fallback for CA secrets. Prefer the top-level caSecrets setting so the
+  # same CA secret list can also be used by the Vault sidecar.
   # Example:
   #   caSecrets:
   #     - ldap-ca-cert
   caSecrets: []
-  additionalDnsNames:
-    - localhost
+  additionalDnsNames: []
+
   refreshSeconds: 300
   resources:
     requests:

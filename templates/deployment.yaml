@@ -44,7 +44,10 @@ spec:
 {{ toYaml .Values.sts.hostAliases | indent 8 }}
 {{- end }}
       serviceAccountName: {{ include "apache-nifi.serviceAccountName" . }}
-{{- if .Values.terminationGracePeriodSeconds }}
+      {{- if .Values.affinity }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
 {{- end }}
 {{- if .Values.tolerations }}
@@ -59,13 +62,88 @@ spec:
       securityContext:
 {{ toYaml .Values.securityContext | indent 8 }}
 {{- end }}
-      containers:
 #--------------------START Vault Sidecar
 {{- $vals := .Values.VaultNiFiSecrets -}}
+{{- $caSecrets := .Values.caSecrets -}}
+{{- $caSecretName := default "" $vals.vaultSidecar.caSecretName -}}
+{{- if and (eq $caSecretName "") (gt (len $caSecrets) 0) -}}
+{{- $caSecretName = index $caSecrets 0 -}}
+{{- end -}}
+{{- $caBundlePath := "/opt/nifi/nifi-current/tls/ca-bundle/ca-bundle.pem" -}}
+{{- if ne $caSecretName "" }}
+      initContainers:
+      - name: prepare-ca-bundle
+        image: {{ default (printf "%s:%s" .Values.images.utility.repository .Values.images.utility.tag) .Values.NiFiSync.s3Sync.sidecar.image }}
+        imagePullPolicy: {{ .Values.images.utility.pullPolicy }}
+        command: ["/bin/sh", "-ec"]
+        args:
+          - |
+            set -e
+            out=/work/ca-bundle.pem
+            : > "$out"
+            
+            # If s3sync is enabled, merge system CA bundle with custom CAs for boto3
+            {{- if .Values.NiFiSync.s3Sync.enabled }}
+            merged=/merged-certs/ca-bundle.crt
+            : > "$merged"
+            # Try RHEL/UBI then Debian/Alpine system CA paths
+            for system_ca in /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/certs/ca-certificates.crt; do
+              if [ -f "$system_ca" ]; then
+                cat "$system_ca" >> "$merged"
+                printf '\n' >> "$merged"
+                echo "Added system CA bundle from $system_ca"
+                break
+              fi
+            done
+            {{- end }}
+            
+            # Extract and bundle custom CA files
+            found=0
+            for file in /input/*; do
+              [ -f "$file" ] || continue
+              case "$file" in
+                *.crt|*.cer|*.pem)
+                  cat "$file" >> "$out"
+                  printf '\n' >> "$out"
+                  {{- if .Values.NiFiSync.s3Sync.enabled }}
+                  cat "$file" >> "$merged"
+                  printf '\n' >> "$merged"
+                  {{- end }}
+                  found=1
+                  ;;
+              esac
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "No CA files found in /input" >&2
+              exit 1
+            fi
+            {{- if .Values.NiFiSync.s3Sync.enabled }}
+            chmod 644 "$merged"
+            echo "Merged CA bundle created at /merged-certs/ca-bundle.crt"
+            {{- end }}
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        volumeMounts:
+          - name: {{ $caSecretName }}
+            mountPath: /input
+            readOnly: true
+          - name: vault-ca-bundle
+            mountPath: /work
+          {{- if .Values.NiFiSync.s3Sync.enabled }}
+          - name: merged-ca-bundle
+            mountPath: /merged-certs
+          {{- end }}
+{{- end }}
+      containers:
 {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
 
       - name: vault-sidecar
-        image: {{ required "VaultNiFiSecrets.vaultSidecarImage must be set when secretProvider=vaultSidecar" .Values.VaultNiFiSecrets.vaultSidecarImage }}
+        image: {{ required "VaultNiFiSecrets.vaultSidecar.image must be set when secretProvider=vaultSidecar" .Values.VaultNiFiSecrets.vaultSidecar.image }}
         imagePullPolicy: IfNotPresent
         ports:
           - containerPort: 8080
@@ -78,12 +156,25 @@ spec:
             value: "info"
           - name: ENABLE_KAFKA_LOGGING
             value: "True"
+          {{- if ne $caSecretName "" }}
+          - name: REQUESTS_CA_BUNDLE
+            value: {{ $caBundlePath }}
+          - name: SSL_CERT_FILE
+            value: {{ $caBundlePath }}
+          {{- end }}
         volumeMounts:
           - name: vault-sidecar-config
             mountPath: /etc/vault-sidecar
             readOnly: true
           - name: secretfspath
-            mountPath: {{ $vals.defaultContainerPath }}
+            mountPath: {{ default "/opt/nifi/secrets" $vals.defaultContainerPath }}
+          {{- if ne $caSecretName "" }}
+          - name: {{ $caSecretName }}
+            mountPath: /opt/nifi/nifi-current/tls/{{ $caSecretName }}
+            readOnly: true
+          - name: vault-ca-bundle
+            mountPath: /opt/nifi/nifi-current/tls/ca-bundle
+          {{- end }}
         readinessProbe:
           httpGet:
             path: /ready
@@ -105,60 +196,14 @@ spec:
 #--------------------END Vault Sidecar
 {{ if .Values.NiFiSync.s3Sync.enabled }}
       - name: s3-secret-sync
-        image: {{ .Values.NiFiSync.s3Sync.sidecar.image }}
+        image: {{ default (printf "%s:%s" .Values.images.utility.repository .Values.images.utility.tag) .Values.NiFiSync.s3Sync.sidecar.image }}
         resources:
 {{ toYaml .Values.NiFiSync.s3Sync.resources | indent 10 }}
 
-#vault envFrom
-{{- /* collect Vault secrets with secretMode=env for envFrom */ -}}
-{{- $vals := default (dict) .Values.VaultNiFiSecrets -}}
-{{- $envSecrets := list -}}
-{{- $generatedSecretNames := list -}}
-
-{{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSecretOperator") }}
-  {{- range $s := $vals.secrets }}
-    {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
-    {{- if eq $mode "env" }}
-      {{- /* normalize & sanitize */ -}}
-      {{- $nameClean := trimPrefix "/" $s.name -}}
-      {{- $safeName := include "secret.sanitizeName" $nameClean -}}
-      {{- $envSecrets = append $envSecrets (dict "safeName" $safeName "orig" $s) }}
-      {{- $generatedSecretNames = append $generatedSecretNames (printf "vault-%s" $safeName) }}
-    {{- end }}
-  {{- end }}
-{{- end }}
-
-{{- /* Start from user-provided envFrom (could be nil or []) and remove any secretRef we auto-generate */ -}}
-{{- $rawEnvFrom := default (list) .Values.envFrom -}}
-{{- $cleanEnvFrom := list -}}
-
-{{- range $rawEnvFrom }}
-  {{- $item := . -}}
-  {{- $secretRef := default (dict) (index $item "secretRef") -}}
-  {{- $name := default "" (index $secretRef "name") -}}
-  {{- if and $name (has $name $generatedSecretNames) }}
-    {{- /* skip legacy duplicate like vault-nifi-secrets */ -}}
-  {{- else }}
-    {{- $cleanEnvFrom = append $cleanEnvFrom $item }}
-  {{- end }}
-{{- end }}
-
-{{- /* treat envFrom as present only when cleaned list has entries */ -}}
-{{- $hasUserEnvFrom := gt (len $cleanEnvFrom) 0 -}}
-
-{{- /* render envFrom if user envFrom (cleaned) has entries OR any Vault env secrets exist */ -}}
-{{- if or $hasUserEnvFrom (gt (len $envSecrets) 0) }}
+{{- if .Values.envFrom }}
         envFrom:
-{{- if $hasUserEnvFrom }}
-{{ toYaml $cleanEnvFrom | indent 8 }}
+{{ toYaml .Values.envFrom | indent 8 }}
 {{- end }}
-
-{{- range $s := $envSecrets }}
-        - secretRef:
-            name: vault-{{ $s.safeName }}
-{{- end }}
-{{- end }}
-#END vault envFrom
 
 
         env:
@@ -174,6 +219,14 @@ spec:
           value: {{ .Values.NiFiSync.s3Sync.insecure | quote }}
         - name: AWS_DEFAULT_REGION
           value: {{ .Values.NiFiSync.s3Sync.region | quote }}
+        {{- if ne $caSecretName "" }}
+        - name: REQUESTS_CA_BUNDLE
+          value: /merged-ca-bundle/ca-bundle.crt
+        - name: SSL_CERT_FILE
+          value: /merged-ca-bundle/ca-bundle.crt
+        - name: AWS_CA_BUNDLE
+          value: /merged-ca-bundle/ca-bundle.crt
+        {{- end }}
         command: ["/bin/sh", "-c"]
         args:
         - |
@@ -230,37 +283,17 @@ spec:
           fi 
           
           #END Wait for vault sidecar 
-
-          mkdir -p /tmp/scripts
-          cat /etc/scripts/generate-env.sh > /tmp/scripts/generate-env.sh
-          chmod +x /tmp/scripts/generate-env.sh
-          # Collect all secrets with secretMode=env into a list
-          env_payloads=""
-          {{- range $i, $s := $vals.secrets }}
-          {{- $mode := "" -}}
-          {{- if $s.secretMode }}{{- $mode = (lower $s.secretMode) }}{{- end -}}
-          {{- if eq $mode "env" }}
-          env_payloads="${env_payloads} {{ $s.name }}::{{ printf "%s/%s" (trimSuffix "/" (default $vals.defaultContainerPath $s.containerPath)) $s.name }}"
-          {{- end }}
-          {{- end }}
-          # Call generate-env.sh with the list
-          /tmp/scripts/generate-env.sh ${env_payloads}
-          # Source the generated env file
-          if [ -f /tmp/env.sh ]; then
-            echo "Sourcing secrets environment variables"
-            . /tmp/env.sh
-          else
-            echo "No secrets environment file found at /tmp/env.sh"
-          fi
-          #END
 {{- end }}
 {{/* END Wait for vault sidecar readiness */}}
 {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           # Wait until every secret directory has at least one file on disk.
           # The SDK /ready endpoint fires before the first sync cycle writes files.
+          # Only wait for secrets with secretMode: directory
           _svault_timeout=${WAIT_SIDECAR_TIMEOUT:-120}
           _svault_start=$(date +%s)
           {{- range $s := $vals.secrets }}
+          {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+          {{- if eq $mode "directory" }}
           echo "Waiting for secret files in {{ $vals.defaultContainerPath }}/{{ $s.name }} ..."
           while [ -z "$(ls -A '{{ $vals.defaultContainerPath }}/{{ $s.name }}' 2>/dev/null)" ]; do
             if [ $(( $(date +%s) - _svault_start )) -ge "$_svault_timeout" ]; then
@@ -271,12 +304,16 @@ spec:
           done
           echo "Secret files present in {{ $vals.defaultContainerPath }}/{{ $s.name }}"
           {{- end }}
+          {{- end }}
           unset _svault_timeout _svault_start
           # Flatten each vault secret's subdirectory into secretsFilePath so all
           # secret files are accessible from a single directory.
+          # Only flatten secrets with secretMode: directory
           {{- $sp := .Values.properties.secretsFilePath }}
           mkdir -p "{{ $sp }}"
           {{- range $s := $vals.secrets }}
+          {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+          {{- if eq $mode "directory" }}
           {{- $srcDir := printf "%s/%s" $vals.defaultContainerPath $s.name }}
           {{- if ne $srcDir $sp }}
           for _f in "{{ $srcDir }}"/*; do
@@ -286,11 +323,12 @@ spec:
           {{- end }}
           {{- end }}
 {{- end }}
+{{- end }}
           # s3sync.py replaces the MinIO `mc` client; credentials resolve via the
           # boto3 default chain (IRSA) or S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY.
           S3SYNC=/scripts/s3sync.py
           export S3_BUCKET S3_ENDPOINT instanceName
-          {{- if and (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") (ne "" (default "" .Values.properties.secretsFilePath)) }}
+          {{- if and (not .Values.NiFiSync.s3Sync.useIRSA) (ne (include "nifi.effectiveSecretsMode" .) "none") (ne "" (default "" .Values.properties.secretsFilePath)) }}
           # Load S3 credentials from the secrets file directory (non-IRSA)
           _sp={{ .Values.properties.secretsFilePath | quote }}
           export S3_ACCESS_KEY_ID="$(tr -d '\r\n' < "$_sp/S3_ACCESS_KEY_ID" 2>/dev/null)"
@@ -302,19 +340,20 @@ spec:
           python3 "$S3SYNC" wait-ready
 
           # Initial synchronization logic: ensure remote prefixes exist
-          {{- range .Values.NiFiSync.syncPaths }}
+          {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
           # Sync Secrets
           {{- if ne .pathType "fs" }}
-          echo "INFO - Sync Secret Path: {{ .localPath }} with S3: $S3_BUCKET/$instanceName/{{ .remotePath }}"
+          {{- $root := default "$instanceName" .remoteRoot }}
+          echo "INFO - Sync Secret Path: {{ .localPath }} with S3: $S3_BUCKET/{{ $root }}/{{ .remotePath }}"
 
           if [ ! -d "/tmp/sync{{ .localPath }}" ]; then
             mkdir -p /tmp/sync{{ .localPath }}
           fi
 
           # Check if remote path exists in S3, if not, create it by uploading an empty placeholder
-          if ! python3 "$S3SYNC" prefix-exists --remote "$instanceName/{{ .remotePath }}"; then
-            echo "INFO - Creating Remote Path $instanceName/{{ .remotePath }} in S3"
-            python3 "$S3SYNC" put-placeholder --remote "$instanceName/{{ .remotePath }}"
+          if ! python3 "$S3SYNC" prefix-exists --remote "{{ $root }}/{{ .remotePath }}"; then
+            echo "INFO - Creating Remote Path {{ $root }}/{{ .remotePath }} in S3"
+            python3 "$S3SYNC" put-placeholder --remote "{{ $root }}/{{ .remotePath }}"
           fi
           {{- end }}
           # END Sync Secrets
@@ -325,11 +364,12 @@ spec:
 
             SYNC_SUCCESS=1  # Initialize sync success flag
 
-            {{- range .Values.NiFiSync.syncPaths }}
+            {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
             {{- if ne .pathType "fs" }}
-            echo "INFO - Syncing Remote Path $instanceName/{{ .remotePath }} to /tmp/sync{{ .localPath }}"
+            {{- $root := default "$instanceName" .remoteRoot }}
+            echo "INFO - Syncing Remote Path {{ $root }}/{{ .remotePath }} to /tmp/sync{{ .localPath }}"
 
-            if ! python3 "$S3SYNC" mirror-down --remote "$instanceName/{{ .remotePath }}" --local /tmp/sync{{ .localPath }} --exclude .placeholder --overwrite; then
+            if ! python3 "$S3SYNC" mirror-down --remote "{{ $root }}/{{ .remotePath }}" --local /tmp/sync{{ .localPath }} --exclude .placeholder{{- if $.Values.NiFiSync.s3Sync.overwrite }} --overwrite{{- end }}; then
               echo "Warning: Sync failed for {{ .localPath }}. S3 might be unavailable."
               SYNC_SUCCESS=0  # Set sync success flag to 0 if any sync fails
             fi
@@ -347,41 +387,76 @@ spec:
             fi
 
             echo "INFO - --------------------------- Completed S3 to Kubernetes Secrets Sync Process --------------------------"
-            echo "INFO - Next Sync: {{ .Values.NiFiSync.s3Sync.syncInterval }} "
-            sleep {{ .Values.NiFiSync.s3Sync.syncInterval }}
+            echo "INFO - Next Sync: {{ $.Values.NiFiSync.s3Sync.syncInterval }} "
+            sleep {{ $.Values.NiFiSync.s3Sync.syncInterval }}
           done
         volumeMounts:
       # VaultSecretMounts
       {{- $vals := .Values.VaultNiFiSecrets }}
       {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
         - name: secretfspath
-          mountPath: {{ $vals.defaultContainerPath }}
-        - name: secret-env-script
-          mountPath: /etc/scripts
+          mountPath: {{ default "/opt/nifi/secrets" $vals.defaultContainerPath }}
+        - name: vault-sync-script
+          mountPath: /etc/vault-sidecar/script
       {{- end }}
-      # END VaultSecretMounts        
+      # END VaultSecretMounts
+        {{- $vaultOwnsSecretsPath := and .Values.VaultNiFiSecrets.enabled (eq (default "" .Values.VaultNiFiSecrets.secretProvider) "vaultSidecar") }}
+        {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (not $vaultOwnsSecretsPath) }}
+        - name: k8s-secrets
+          mountPath: {{ default "/opt/nifi/secrets" .Values.properties.secretsFilePath }}
+          readOnly: true
+        {{- end }}
         - mountPath: /run/secrets/kubernetes.io/default-token
           name: default-token   
         - mountPath: /run/secrets/kubernetes.io/secret-modifier-token
           name: secret-modifier-token
         - mountPath: /scripts
           name: nifisync-scripts
+        {{- if ne $caSecretName "" }}
+        - name: vault-ca-bundle
+          mountPath: /opt/nifi/nifi-current/tls/ca-bundle
+          readOnly: true
+        - name: merged-ca-bundle
+          mountPath: /merged-ca-bundle
+          readOnly: true
+        {{- end }}
       volumes:
     #VaultSecretVolumes
       {{- $vals := .Values.VaultNiFiSecrets }}
+      {{- $caSecrets := .Values.caSecrets -}}
+      {{- $caSecretName := default "" $vals.vaultSidecar.caSecretName -}}
+      {{- if and (eq $caSecretName "") (gt (len $caSecrets) 0) -}}
+      {{- $caSecretName = index $caSecrets 0 -}}
+      {{- end -}}
       {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
       - name: vault-sidecar-config
         configMap:
           name: vault-sidecar-config
+      - name: vault-sync-script
+        configMap:
+          name: vault-sync-script
+          defaultMode: 0550
       - name: secretfspath
         emptyDir: {} 
-      - name: secret-env-script
-        configMap:
-          name: secret-env-script
-          defaultMode: 0440              
+      {{- end }}
+      {{- if ne $caSecretName "" }}
+      - name: {{ $caSecretName }}
+        secret:
+          secretName: {{ $caSecretName }}
+      - name: vault-ca-bundle
+        emptyDir: {}
+      {{- if .Values.NiFiSync.s3Sync.enabled }}
+      - name: merged-ca-bundle
+        emptyDir: {}
+      {{- end }}
       {{- end }}
       #END VaultSecretVolumes
 {{- if .Values.NiFiSync.s3Sync.enabled}}
+      {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") }}
+      - name: k8s-secrets
+        secret:
+          secretName: {{ .Values.properties.secretsName }}
+      {{- end }}
       - name: nifisync-scripts
         configMap:
           name: {{ template "apache-nifi.fullname" $ }}-nifisync-scripts
@@ -392,5 +467,4 @@ spec:
         secret:
           secretName: {{ template "apache-nifi.fullname" $ }}-sync-default-token
 {{- /* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}
-{{/* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}
 {{/* if .Values.NiFiSync.s3Sync.enabled */}}{{ end }}

@@ -1,4 +1,4 @@
-{{ if .Values.Logging.enabled }}
+{{ if .Values.clusterLogging.enabled }}
 apiVersion: logging.banzaicloud.io/v1beta1
 kind: Flow
 metadata:
@@ -22,7 +22,7 @@ spec:
         reserve_data: true
 
   globalOutputRefs:
-    - {{ .Values.Logging.clusterOutput }}
+    - {{ .Values.clusterLogging.clusterOutput }}
   match:
     - select:
         container_names:
@@ -30,4 +30,4 @@ spec:
           - bootstarp-log
           - user-log
 
-{{/* if .Values.Logging.enabled */}}{{ end }}
+{{/* if .Values.clusterLogging.enabled */}}{{ end }}

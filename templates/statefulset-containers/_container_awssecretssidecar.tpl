@@ -1,7 +1,7 @@
 {{- define "nifi.container.awsSecretsSidecar" }}
       - name: aws-secrets-sync
-        image: "{{ .Values.awsSecretsSync.image.repository }}:{{ .Values.awsSecretsSync.image.tag }}"
-        imagePullPolicy: {{ .Values.awsSecretsSync.image.pullPolicy }}
+        image: "{{ .Values.images.utility.repository }}:{{ .Values.images.utility.tag }}"
+        imagePullPolicy: {{ .Values.images.utility.pullPolicy }}
         resources:
 {{ toYaml .Values.awsSecretsSync.resources | indent 10 }}
         command: ["/bin/sh", "-c"]

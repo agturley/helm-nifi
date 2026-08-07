@@ -1,59 +1,14 @@
 {{- define "nifi.container.certManager" }}
 {{- $vals := .Values.VaultNiFiSecrets }}
+{{- $caSecrets := default .Values.certManager.caSecrets .Values.caSecrets }}
       - name: cert-manager
-        imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.images.nifi.pullPolicy | quote }}
+        image: "{{ .Values.images.nifi.repository }}:{{ .Values.images.nifi.tag }}"
 
-#vault envFrom
-{{- /* collect Vault secrets with secretMode=env for envFrom */ -}}
-{{- $vals := default (dict) .Values.VaultNiFiSecrets -}}
-{{- $envSecrets := list -}}
-{{- $generatedSecretNames := list -}}
-
-{{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSecretOperator") }}
-  {{- range $s := $vals.secrets }}
-    {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
-    {{- if eq $mode "env" }}
-      {{- /* normalize & sanitize */ -}}
-      {{- $nameClean := trimPrefix "/" $s.name -}}
-      {{- $safeName := include "secret.sanitizeName" $nameClean -}}
-      {{- $envSecrets = append $envSecrets (dict "safeName" $safeName "orig" $s) }}
-      {{- $generatedSecretNames = append $generatedSecretNames (printf "vault-%s" $safeName) }}
-    {{- end }}
-  {{- end }}
-{{- end }}
-
-{{- /* Start from user-provided envFrom (could be nil or []) and remove any secretRef we auto-generate */ -}}
-{{- $rawEnvFrom := default (list) .Values.envFrom -}}
-{{- $cleanEnvFrom := list -}}
-
-{{- range $rawEnvFrom }}
-  {{- $item := . -}}
-  {{- $secretRef := default (dict) (index $item "secretRef") -}}
-  {{- $name := default "" (index $secretRef "name") -}}
-  {{- if and $name (has $name $generatedSecretNames) }}
-    {{- /* skip legacy duplicate like vault-nifi-secrets */ -}}
-  {{- else }}
-    {{- $cleanEnvFrom = append $cleanEnvFrom $item }}
-  {{- end }}
-{{- end }}
-
-{{- /* treat envFrom as present only when cleaned list has entries */ -}}
-{{- $hasUserEnvFrom := gt (len $cleanEnvFrom) 0 -}}
-
-{{- /* render envFrom if user envFrom (cleaned) has entries OR any Vault env secrets exist */ -}}
-{{- if or $hasUserEnvFrom (gt (len $envSecrets) 0) }}
+{{- if .Values.envFrom }}
         envFrom:
-{{- if $hasUserEnvFrom }}
-{{ toYaml $cleanEnvFrom | indent 8 }}
+{{ toYaml .Values.envFrom | indent 8 }}
 {{- end }}
-
-{{- range $s := $envSecrets }}
-        - secretRef:
-            name: vault-{{ $s.safeName }}
-{{- end }}
-{{- end }}
-#END vault envFrom
 
         command:
         - bash
@@ -100,29 +55,6 @@
           fi 
           
           #END Wait for vault sidecar 
-
-          mkdir -p /tmp/scripts
-          cat /etc/scripts/generate-env.sh > /tmp/scripts/generate-env.sh
-          chmod +x /tmp/scripts/generate-env.sh
-          # Collect all secrets with secretMode=env into a list
-          env_payloads=""
-          {{- range $i, $s := $vals.secrets }}
-          {{- $mode := "" -}}
-          {{- if $s.secretMode }}{{- $mode = (lower $s.secretMode) }}{{- end -}}
-          {{- if eq $mode "env" }}
-          env_payloads="${env_payloads} {{ $s.name }}::{{ printf "%s/%s" (trimSuffix "/" (default $vals.defaultContainerPath $s.containerPath)) $s.name }}"
-          {{- end }}
-          {{- end }}
-          # Call generate-env.sh with the list
-          /tmp/scripts/generate-env.sh ${env_payloads}
-          # Source the generated env file
-          if [ -f /tmp/env.sh ]; then
-            echo "Sourcing secrets environment variables"
-            . /tmp/env.sh
-          else
-            echo "No secrets environment file found at /tmp/env.sh"
-          fi
-          #END
 {{- end }}
 {{- /* END Wait for vault sidecar readiness */ -}}
           #END
@@ -167,9 +99,9 @@
                     -keystore "${NIFI_HOME}/tls/truststore-new.jks" \
                     -storepass "${NIFI_TLS_TRUSTSTORE_PASSWORD}"
           done
-          {{- if .Values.certManager.caSecrets }}
-          # Import any .crt/.cer/.pem from certManager.caSecrets mounts
-          {{- range .Values.certManager.caSecrets }}
+          {{- if $caSecrets }}
+          # Import any .crt/.cer/.pem from shared caSecrets mounts
+          {{- range $caSecrets }}
           for ca in "${NIFI_HOME}/tls/{{ . }}"/*.crt "${NIFI_HOME}/tls/{{ . }}"/*.cer "${NIFI_HOME}/tls/{{ . }}"/*.pem
           do
             [[ -f "$ca" ]] || continue
@@ -187,7 +119,7 @@
           {{- end }}
           {{- end }}
           {{- if .Values.NiFiSync.s3Sync.enabled}}
-          {{- range .Values.NiFiSync.syncPaths }}
+          {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
           {{- if and (default true .enabled) (eq .pathType "ca-secret") }}
           _found_ca=0
           for ca in {{ .localPath }}/*.crt {{ .localPath }}/*.cer {{ .localPath }}/*.pem
@@ -247,9 +179,9 @@
                       -keystore "$MERGED_CACERTS" \
                       -storepass "$_jvm_cacerts_storepass" 2>&1 || true
             done
-            {{- if .Values.certManager.caSecrets }}
-            # Also import certs from certManager.caSecrets mounts
-            {{- range .Values.certManager.caSecrets }}
+            {{- if $caSecrets }}
+            # Also import certs from shared caSecrets mounts
+            {{- range $caSecrets }}
             for _ca_f in "${NIFI_HOME}/tls/{{ . }}"/*.crt "${NIFI_HOME}/tls/{{ . }}"/*.cer "${NIFI_HOME}/tls/{{ . }}"/*.pem; do
               [ -f "$_ca_f" ] || continue
               _ca_i=$((_ca_i + 1))
@@ -263,7 +195,7 @@
             {{- end }}
             {{- end }}
             {{- if .Values.NiFiSync.s3Sync.enabled }}
-            {{- range .Values.NiFiSync.syncPaths }}
+            {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
             {{- if and (default true .enabled) (eq .pathType "ca-secret") }}
             # Also import S3-synced certs from {{ .localPath }} (ca-secret path)
             for _ca_f in {{ .localPath }}/*.crt {{ .localPath }}/*.cer {{ .localPath }}/*.pem; do
@@ -335,7 +267,7 @@
           done
         volumeMounts:
     {{- if eq (include "nifi.secretSyncEnabled" $) "true" }}
-        {{- range .Values.NiFiSync.syncPaths }}
+        {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
         {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
             mountPath: {{ .localPath }}
@@ -363,9 +295,7 @@
 
       {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           - name: secretfspath
-            mountPath: {{ $vals.defaultContainerPath }}
-          - name: secret-env-script
-            mountPath: /etc/scripts
+            mountPath: {{ default "/opt/nifi/secrets" $vals.defaultContainerPath }}
       {{- end }}
 
     #END VaultSecretMounts
@@ -394,7 +324,7 @@
               {{- end }}
             {{- end }}
           {{- end }}
-          {{ range $secret := .Values.certManager.caSecrets }}
+          {{ range $secret := $caSecrets }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ $secret }}
             mountPath: /opt/nifi/nifi-current/tls/{{ $secret }}
             readOnly: true
@@ -422,7 +352,7 @@
           - name: aws-secrets-path
             mountPath: {{ .Values.awsSecretsSync.outputPath }}
           {{- end }}
-          {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") }}
+          {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") }}
           - name: k8s-secrets
             mountPath: {{ .Values.properties.secretsFilePath }}
             readOnly: true

@@ -1,0 +1,190 @@
+{{- if .Values.VaultNiFiSecrets.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-vault-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ include "apache-nifi.fullname" . }}
+    chart: {{ include "apache-nifi.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+data:
+{{- $vals := .Values.VaultNiFiSecrets }}
+{{- $hasJsonAwsSecret := false }}
+{{- range $s := $vals.secrets }}
+{{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+{{- if and (eq $mode "aws-credential") (eq (default "" $s.awsCredentialFormat) "json") }}
+{{- $hasJsonAwsSecret = true }}
+{{- end }}
+{{- end }}
+{{- if $hasJsonAwsSecret }}
+  # AWS shared config file (~/.aws/config style) wiring `credential_process` for
+  # each secretMode: aws-credential (awsCredentialFormat: json) secret.
+  # Mounted at /opt/nifi/vault-scripts/aws-config and referenced via AWS_CONFIG_FILE
+  # so the AWS SDK/CLI automatically discovers and refreshes credentials.
+  aws-config: |
+    {{- $first := true }}
+    {{- range $s := $vals.secrets }}
+    {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+    {{- if and (eq $mode "aws-credential") (eq (default "" $s.awsCredentialFormat) "json") }}
+    {{- $outputFile := default $s.name $s.outputFile }}
+    {{- $jsonPath := "" }}
+    {{- if $s.flattenTo }}
+    {{- $jsonPath = printf "%s/%s" $s.flattenTo $outputFile }}
+    {{- else if $s.containerPath }}
+    {{- $jsonPath = printf "%s/%s" $s.containerPath $outputFile }}
+    {{- else }}
+    {{- $jsonPath = printf "%s/%s" $vals.defaultContainerPath $outputFile }}
+    {{- end }}
+    {{- if $first }}
+    [default]
+    credential_process = /opt/nifi/vault-scripts/aws_credential_refresh.sh --file {{ $jsonPath }}
+    {{- $first = false }}
+    {{- end }}
+    [profile {{ $s.name }}]
+    credential_process = /opt/nifi/vault-scripts/aws_credential_refresh.sh --file {{ $jsonPath }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+  # AWS credential refresh script for credential_process integration
+  # Reads JSON credentials from vault sidecar and triggers refresh if expiring
+  aws_credential_refresh.sh: |
+    #!/usr/bin/env bash
+    #
+    # aws_credential_refresh.sh
+    #
+    # Companion script for AWS CLI/SDK `credential_process`. Reads the JSON
+    # credentials file produced by vault-sync (secretMode: aws-credential,
+    # awsCredentialFormat: json) and prints it to stdout in the
+    # credential_process schema AWS expects:
+    #   { "Version": 1, "AccessKeyId": ..., "SecretAccessKey": ..., "SessionToken": ..., "Expiration": ... }
+    #
+    # If the cached credentials are expiring soon (within --buffer seconds),
+    # this script triggers vault-sync to refresh immediately (via SIGHUP,
+    # see README "Hot reload and ConfigMap updates") and waits for the file
+    # to be rewritten before returning it.
+    #
+    # Usage:
+    #   aws_credential_refresh.sh --file /opt/nifi/secrets/aws-creds [options]
+    #
+    # Options:
+    #   --file <path>       Path to the JSON credentials file written by vault-sync (required;
+    #                        can also be set via AWS_CREDENTIALS_JSON_FILE env var)
+    #   --pid <pid>          PID to send SIGHUP to for an immediate resync (default: auto-discover
+    #                        from /opt/nifi/secrets/.vault-sync.pid, or 1 if file doesn't exist)
+    #   --buffer <seconds>   Minimum remaining TTL (seconds) before triggering a refresh (default: 300)
+    #   --wait <seconds>     Max seconds to wait for the file to update after SIGHUP (default: 10)
+    #   --no-refresh         Never trigger SIGHUP; just print the file as-is
+    #   --help               Show this help message
+    #
+    # AWS CLI / SDK configuration (~/.aws/config):
+    #   [profile myrole]
+    #   credential_process = /opt/nifi/vault-scripts/aws_credential_refresh.sh --file /opt/nifi/secrets/aws-creds
+    #
+    # Notes:
+    #   - Requires the vault-sync entry to use: secretMode: aws-credential, awsCredentialFormat: json
+    #   - vault-sync PID is auto-discovered from /opt/nifi/secrets/.vault-sync.pid if available.
+    #     This file should be written by vault-sync on startup: echo $$ > /opt/nifi/secrets/.vault-sync.pid
+    #     Override with --pid if vault-sync runs elsewhere or if auto-discovery is not available.
+
+    set -euo pipefail
+
+    FILE="${AWS_CREDENTIALS_JSON_FILE:-}"
+    SIGHUP_PID="1"
+    BUFFER=300
+    WAIT_SECONDS=10
+    NO_REFRESH=0
+
+    show_help() {
+      sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+    }
+
+    pid_explicit=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --file)
+          FILE="$2"; shift 2 ;;
+        --pid)
+          SIGHUP_PID="$2"; pid_explicit=1; shift 2 ;;
+        --buffer)
+          BUFFER="$2"; shift 2 ;;
+        --wait)
+          WAIT_SECONDS="$2"; shift 2 ;;
+        --no-refresh)
+          NO_REFRESH=1; shift ;;
+        --help)
+          show_help; exit 0 ;;
+        *)
+          echo "Unknown option: $1" >&2
+          show_help
+          exit 1 ;;
+      esac
+    done
+
+    if [[ -z "$FILE" ]]; then
+      echo "Error: --file <path> is required (or set AWS_CREDENTIALS_JSON_FILE)" >&2
+      exit 1
+    fi
+
+    # Auto-discover vault-sync PID from file if not explicitly provided
+    if [[ $pid_explicit -eq 0 ]] && [[ -f /opt/nifi/secrets/.vault-sync.pid ]]; then
+      SIGHUP_PID=$(cat /opt/nifi/secrets/.vault-sync.pid 2>/dev/null || echo "1")
+    fi
+
+    # Extract a JSON string field value without depending on jq
+    # Handles: "Field": "value" or "Field": "value with / escaped chars"
+    json_field() {
+      local field="$1" json="$2"
+      printf '%s' "$json" | sed -n "s/.*\"${field}\" *: *\"\\([^\"]*\\)\".*/\\1/p" | head -n1
+    }
+
+    expiration_epoch() {
+      local exp_iso="$1"
+      if [[ -z "$exp_iso" ]]; then
+        return 1
+      fi
+      if [[ "$OSTYPE" == "darwin"* ]]; then
+        date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$exp_iso" "+%s" 2>/dev/null
+      else
+        date -u -d "$exp_iso" "+%s" 2>/dev/null
+      fi
+    }
+
+    if [[ ! -f "$FILE" ]]; then
+      echo "Error: credentials file not found: $FILE" >&2
+      exit 1
+    fi
+
+    CREDS=$(cat "$FILE")
+    EXPIRATION=$(json_field "Expiration" "$CREDS")
+    NOW=$(date +%s)
+    REMAINING=0
+
+    if [[ -n "$EXPIRATION" ]]; then
+      EXP_EPOCH=$(expiration_epoch "$EXPIRATION" || echo "0")
+      REMAINING=$((EXP_EPOCH - NOW))
+    fi
+
+    # If credential is expiring within buffer window and refresh is allowed
+    if [[ $REMAINING -lt $BUFFER ]] && [[ $NO_REFRESH -eq 0 ]]; then
+      kill -HUP "$SIGHUP_PID" 2>/dev/null || true
+
+      # Wait for file to be updated by vault-sync
+      WAITED=0
+      while [[ $WAITED -lt $WAIT_SECONDS ]]; do
+        sleep 0.5
+        if [[ -f "$FILE" ]]; then
+          NEW_CREDS=$(cat "$FILE")
+          NEW_EXPIRATION=$(json_field "Expiration" "$NEW_CREDS")
+          if [[ "$NEW_EXPIRATION" != "$EXPIRATION" ]]; then
+            CREDS="$NEW_CREDS"
+            break
+          fi
+        fi
+        WAITED=$((WAITED + 1))
+      done
+    fi
+
+    echo "$CREDS"
+{{- end }}

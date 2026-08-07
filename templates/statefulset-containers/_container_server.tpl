@@ -1,8 +1,8 @@
 {{- define "nifi.container.server" }}
 {{- $vals := .Values.VaultNiFiSecrets }}
       - name: server
-        imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.images.nifi.pullPolicy | quote }}
+        image: "{{ .Values.images.nifi.repository }}:{{ .Values.images.nifi.tag }}"
         command:
         - bash
         - -ce
@@ -47,36 +47,16 @@
           fi 
           
           #END Wait for vault sidecar 
-
-          mkdir -p /tmp/scripts
-          cat /etc/scripts/generate-env.sh > /tmp/scripts/generate-env.sh
-          chmod +x /tmp/scripts/generate-env.sh
-          # Collect all secrets with secretMode=env into a list
-          env_payloads=""
-          {{- range $i, $s := $vals.secrets }}
-          {{- $mode := "" -}}
-          {{- if $s.secretMode }}{{- $mode = (lower $s.secretMode) }}{{- end -}}
-          {{- if eq $mode "env" }}
-          env_payloads="${env_payloads} {{ $s.name }}::{{ printf "%s/%s" (trimSuffix "/" (default $vals.defaultContainerPath $s.containerPath)) $s.name }}"
-          {{- end }}
-          {{- end }}
-          # Call generate-env.sh with the list
-          /tmp/scripts/generate-env.sh ${env_payloads}
-          # Source the generated env file
-          if [ -f /tmp/env.sh ]; then
-            echo "Sourcing secrets environment variables"
-            . /tmp/env.sh
-          else
-            echo "No secrets environment file found at /tmp/env.sh"
-          fi
-          #END
 {{- end }}
 {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           # Wait until every secret directory has at least one file on disk.
           # The SDK /ready endpoint fires before the first sync cycle writes files.
+          # Only wait for secrets with secretMode: directory
           _svault_timeout=${WAIT_SIDECAR_TIMEOUT:-120}
           _svault_start=$(date +%s)
           {{- range $s := $vals.secrets }}
+          {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+          {{- if eq $mode "directory" }}
           echo "Waiting for secret files in {{ $vals.defaultContainerPath }}/{{ $s.name }} ..."
           while [ -z "$(ls -A '{{ $vals.defaultContainerPath }}/{{ $s.name }}' 2>/dev/null)" ]; do
             if [ $(( $(date +%s) - _svault_start )) -ge "$_svault_timeout" ]; then
@@ -87,18 +67,23 @@
           done
           echo "Secret files present in {{ $vals.defaultContainerPath }}/{{ $s.name }}"
           {{- end }}
+          {{- end }}
           unset _svault_timeout _svault_start
           # Flatten each vault secret's subdirectory into secretsFilePath so all
           # secret files are accessible from a single directory.
+          # Only flatten secrets with secretMode: directory
           {{- $sp := .Values.properties.secretsFilePath }}
           mkdir -p "{{ $sp }}"
           {{- range $s := $vals.secrets }}
+          {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+          {{- if eq $mode "directory" }}
           {{- $srcDir := printf "%s/%s" $vals.defaultContainerPath $s.name }}
           {{- if ne $srcDir $sp }}
           for _f in "{{ $srcDir }}"/*; do
             [ -f "$_f" ] || continue
             cp "$_f" "{{ $sp }}/$(basename "$_f")"
           done
+          {{- end }}
           {{- end }}
           {{- end }}
 {{- end }}
@@ -147,7 +132,7 @@
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='TLS - Truststore Password']" -v "${NIFI_TLS_TRUSTSTORE_PASSWORD}" "${NIFI_HOME}/conf/login-identity-providers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager DN']" -v "${LDAP_MANAGER_DN}" "${NIFI_HOME}/conf/login-identity-providers.xml"
           xmlstarlet ed --inplace --update "//loginIdentityProviders/provider/property[@name='Manager Password']" -v "${LDAP_MANAGER_PASSWORD}" "${NIFI_HOME}/conf/login-identity-providers.xml"
-          {{- if semverCompare "< 2.0.0-0" .Values.image.tag }}
+          {{- if semverCompare "< 2.0.0-0" .Values.images.nifi.tag }}
           xmlstarlet ed --inplace --update "//authorizers/authorizer/property[@name='Initial Admin Identity']" -v "${INITIAL_ADMIN_IDENTITY}" "${NIFI_HOME}/conf/authorizers.xml"
           {{- end }}
           prop_replace nifi.sensitive.props.key "${NIFI_SENSITIVE_PROPS_KEY}"
@@ -320,9 +305,11 @@
           }
 
           function offloadNode() {
-              FQDN=$(hostname -f)
+              local FQDN=$(hostname -f)
+              local max_wait=25
+              local elapsed=0
               echo "disconnecting node '$FQDN'"
-              baseUrl=https://${FQDN}:{{ .Values.properties.httpsPort }}
+              local baseUrl=https://${FQDN}:{{ .Values.properties.httpsPort }}
 
               echo "keystoreType=$(prop nifi.security.keystoreType)" > secure.properties
               echo "keystore=$(prop nifi.security.keystore)" >> secure.properties
@@ -332,54 +319,89 @@
               echo "truststorePasswd=$(prop nifi.security.truststorePasswd)" >> secure.properties
               echo "proxiedEntity={{ .Values.auth.admin }}" >> secure.properties
              
-              secureArgs="-p secure.properties"
+              local secureArgs="-p secure.properties"
 
               echo baseUrl ${baseUrl}
               echo "gracefully disconnecting node '$FQDN' from cluster"
               ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > nodes.json
-              nnid=$(jq --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .nodeId' nodes.json)
+              local nnid=$(jq --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .nodeId' nodes.json)
+              
+              # Validate initial state - if already OFFLOADED or missing, skip drain
+              local node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' nodes.json)
+              if [[ "${node_state}" == "OFFLOADED" ]] || [[ -z "${node_state}" ]]; then
+                  echo "node already in terminal state or not found (state='${node_state}'). Skipping drain."
+                  return 0
+              fi
+              
               echo "disconnecting node ${nnid}"
-              ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi disconnect-node -nnid $nnid -u ${baseUrl} ${secureArgs}
+              if ! ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi disconnect-node -nnid $nnid -u ${baseUrl} ${secureArgs}; then
+                  echo "WARNING: disconnect-node command failed. Proceeding with shutdown."
+                  return 1
+              fi
               echo ""
               echo "get a connected node"
-              connectedNode=$(jq -r 'first(.cluster.nodes|=sort_by(.address)| .cluster.nodes[] | select(.status=="CONNECTED")) | .address' nodes.json)
+              local connectedNode=$(jq -r 'first(.cluster.nodes|=sort_by(.address)| .cluster.nodes[] | select(.status=="CONNECTED")) | .address' nodes.json)
+              # Fallback: if no CONNECTED node found, use any available node
+              if [[ -z "${connectedNode}" ]] || [[ "${connectedNode}" == "null" ]]; then
+                  echo "WARNING: no CONNECTED node found. Using any available node."
+                  connectedNode=$(jq -r '.cluster.nodes[0].address' nodes.json)
+              fi
               baseUrl=https://${connectedNode}:{{ .Values.properties.httpsPort }}
               echo baseUrl ${baseUrl}
               echo ""
-              echo "wait until node has state 'DISCONNECTED'"
-              while [[ "${node_state}" != "DISCONNECTED" ]]; do
+              echo "wait until node has state 'DISCONNECTED' (max ${max_wait}s)"
+              elapsed=0
+              while [[ "${node_state}" != "DISCONNECTED" ]] && [[ $elapsed -lt $max_wait ]]; do
                   sleep 1
+                  elapsed=$((elapsed + 1))
                   ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > nodes.json
                   node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' nodes.json)
-                  echo "state is '${node_state}'"
+                  echo "state is '${node_state}' (${elapsed}s)"
               done
+              if [[ $elapsed -ge $max_wait ]]; then
+                  echo "WARNING: timeout waiting for DISCONNECTED state (${node_state}). Proceeding with shutdown."
+                  return 1
+              fi
               echo ""
               echo "node '${nnid}' was disconnected"
               echo "offloading node"
-              ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi offload-node -nnid $nnid -u ${baseUrl} ${secureArgs}
+              if ! ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi offload-node -nnid $nnid -u ${baseUrl} ${secureArgs}; then
+                  echo "WARNING: offload-node command failed. Proceeding with shutdown."
+                  return 1
+              fi
               echo ""
-              echo "wait until node has state 'OFFLOADED'"
-              while [[ "${node_state}" != "OFFLOADED" ]]; do
+              echo "wait until node has state 'OFFLOADED' (max ${max_wait}s)"
+              elapsed=0
+              while [[ "${node_state}" != "OFFLOADED" ]] && [[ $elapsed -lt $max_wait ]]; do
                   sleep 1
+                  elapsed=$((elapsed + 1))
                   ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > nodes.json
                   node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' nodes.json)
-                  echo "state is '${node_state}'"
+                  echo "state is '${node_state}' (${elapsed}s)"
               done
+              if [[ $elapsed -ge $max_wait ]]; then
+                  echo "WARNING: timeout waiting for OFFLOADED state (${node_state}). Proceeding with shutdown."
+                  return 1
+              fi
           }
 
           deleteNode() {
               echo "deleting node"
-              ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi delete-node -nnid ${nnid} -u ${baseUrl} ${secureArgs}
+              if ! ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi delete-node -nnid ${nnid} -u ${baseUrl} ${secureArgs}; then
+                  echo "WARNING: delete-node command failed, but proceeding anyway."
+                  return 1
+              fi
               echo "node deleted"
+              return 0
           }
 
           executeTrap() {
              echo Received trapped signal, beginning shutdown...;
-{{- if .Values.properties.isNode }}
+{{- if and .Values.properties.isNode (not .Values.kubernetesClusterState.enabled) }}
              offloadNode;
 {{- end }}
              ./bin/nifi.sh stop;
-{{- if .Values.properties.isNode }}
+{{- if and .Values.properties.isNode (not .Values.kubernetesClusterState.enabled) }}
              deleteNode;
 {{- end }}
              exit 0;
@@ -414,60 +436,28 @@
         - name: NIFI_WEB_HTTPS_HOST
           value: 0.0.0.0
 {{- end }}
+{{- $vals := .Values.VaultNiFiSecrets }}
+{{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
+{{- $hasJsonAwsSecret := false }}
+{{- range $s := $vals.secrets }}
+{{- $mode := default $vals.defaultSecretMode $s.secretMode }}
+{{- if and (eq $mode "aws-credential") (eq (default "" $s.awsCredentialFormat) "json") }}
+{{- $hasJsonAwsSecret = true }}
+{{- end }}
+{{- end }}
+{{- if $hasJsonAwsSecret }}
+        - name: AWS_CONFIG_FILE
+          value: "/opt/nifi/vault-scripts/aws-config"
+{{- end }}
+{{- end }}
 {{- if .Values.env }}
 {{ toYaml .Values.env | indent 8 }}
 {{- end }}
 
-#vault envFrom
-{{- /* collect Vault secrets with secretMode=env for envFrom */ -}}
-{{- $vals := default (dict) .Values.VaultNiFiSecrets -}}
-{{- $envSecrets := list -}}
-{{- $generatedSecretNames := list -}}
-
-{{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSecretOperator") }}
-  {{- range $s := $vals.secrets }}
-    {{- $mode := default $vals.defaultSecretMode $s.secretMode }}
-    {{- if eq $mode "env" }}
-      {{- /* normalize & sanitize */ -}}
-      {{- $nameClean := trimPrefix "/" $s.name -}}
-      {{- $safeName := include "secret.sanitizeName" $nameClean -}}
-      {{- $envSecrets = append $envSecrets (dict "safeName" $safeName "orig" $s) }}
-      {{- $generatedSecretNames = append $generatedSecretNames (printf "vault-%s" $safeName) }}
-    {{- end }}
-  {{- end }}
-{{- end }}
-
-{{- /* Start from user-provided envFrom (could be nil or []) and remove any secretRef we auto-generate */ -}}
-{{- $rawEnvFrom := default (list) .Values.envFrom -}}
-{{- $cleanEnvFrom := list -}}
-
-{{- range $rawEnvFrom }}
-  {{- $item := . -}}
-  {{- $secretRef := default (dict) (index $item "secretRef") -}}
-  {{- $name := default "" (index $secretRef "name") -}}
-  {{- if and $name (has $name $generatedSecretNames) }}
-    {{- /* skip legacy duplicate like vault-nifi-secrets */ -}}
-  {{- else }}
-    {{- $cleanEnvFrom = append $cleanEnvFrom $item }}
-  {{- end }}
-{{- end }}
-
-{{- /* treat envFrom as present only when cleaned list has entries */ -}}
-{{- $hasUserEnvFrom := gt (len $cleanEnvFrom) 0 -}}
-
-{{- /* render envFrom if user envFrom (cleaned) has entries OR any Vault env secrets exist */ -}}
-{{- if or $hasUserEnvFrom (gt (len $envSecrets) 0) }}
+{{- if .Values.envFrom }}
         envFrom:
-{{- if $hasUserEnvFrom }}
-{{ toYaml $cleanEnvFrom | indent 8 }}
+{{ toYaml .Values.envFrom | indent 8 }}
 {{- end }}
-
-{{- range $s := $envSecrets }}
-        - secretRef:
-            name: vault-{{ $s.safeName }}
-{{- end }}
-{{- end }}
-#END vault envFrom
 
 
 {{- if .Values.postStart }}
@@ -539,16 +529,17 @@
       {{- end }}
       {{- if and $vals.enabled (eq (default "" $vals.secretProvider) "vaultSidecar") }}
           - name: secretfspath
-            mountPath: {{ $vals.defaultContainerPath }}
-          - name: secret-env-script
-            mountPath: /etc/scripts
+            mountPath: {{ default "/opt/nifi/secrets" $vals.defaultContainerPath }}
+          - name: vault-scripts
+            mountPath: /opt/nifi/vault-scripts
+            readOnly: true
       {{- end }}
       # END VaultSecretMounts
       {{- if .Values.awsSecretsSync.enabled }}
           - name: aws-secrets-path
             mountPath: {{ .Values.awsSecretsSync.outputPath }}
       {{- end }}
-      {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") }}
+      {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") }}
           - name: k8s-secrets
             mountPath: {{ .Values.properties.secretsFilePath }}
             readOnly: true
@@ -560,7 +551,7 @@
       {{- end }}
 
     {{- if eq (include "nifi.secretSyncEnabled" $) "true" }}
-        {{- range .Values.NiFiSync.syncPaths }}
+        {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
         {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
           - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
             mountPath: {{ .localPath }}

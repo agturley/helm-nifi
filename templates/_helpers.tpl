@@ -73,6 +73,56 @@ When certManager.issuerRef.name is set, reference that existing
 Issuer/ClusterIssuer; otherwise reference the chart-managed CA Issuer.
 Call with the root context ($).
 */}}
+{{/*
+Default shared identity common name for NiFi authorization mapping.
+Defaults to <namespace>-<releaseName>, with auth.nodeIdentity.shared.identityDomain
+appended as a domain suffix when set.
+*/}}
+{{- define "nifi.clusterCommonName" -}}
+{{- $base := printf "%s-%s" .Release.Namespace (include "apache-nifi.fullname" .) -}}
+{{- $domain := default "" .Values.auth.nodeIdentity.shared.identityDomain -}}
+{{- if $domain -}}{{ printf "%s.%s" $base $domain }}{{- else -}}{{ $base }}{{- end -}}
+{{- end -}}
+
+{{/*
+Effective shared-node identity mapping enabled flag.
+Driven by auth.nodeIdentity.shared.enabled.
+*/}}
+{{- define "nifi.sharedNodeIdentityMappingEnabled" -}}
+{{- $auth := default (dict) .Values.auth -}}
+{{- $nodeIdentity := default (dict) $auth.nodeIdentity -}}
+{{- $shared := default (dict) $nodeIdentity.shared -}}
+{{- if not $shared -}}
+{{- $legacyIdentityMapping := default (dict) $auth.identityMapping -}}
+{{- $shared = default (dict) $legacyIdentityMapping.sharedNode -}}
+{{- end -}}
+{{- ternary "true" "false" (default false $shared.enabled) -}}
+{{- end -}}
+
+{{/*
+Effective shared-node identity CN (without CN= prefix).
+Uses auth.nodeIdentity.shared.identity, then cluster default.
+*/}}
+{{- define "nifi.sharedNodeIdentityCommonName" -}}
+{{- $auth := default (dict) .Values.auth -}}
+{{- $nodeIdentity := default (dict) $auth.nodeIdentity -}}
+{{- $shared := default (dict) $nodeIdentity.shared -}}
+{{- if not $shared -}}
+{{- $legacyIdentityMapping := default (dict) $auth.identityMapping -}}
+{{- $shared = default (dict) $legacyIdentityMapping.sharedNode -}}
+{{- end -}}
+{{- if and (hasKey $shared "identity") (ne (default "" $shared.identity) "") -}}
+{{- $shared.identity -}}
+{{- else -}}
+{{- include "nifi.clusterCommonName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Effective shared-node identity DN used in NiFi policies and mapping value. */}}
+{{- define "nifi.sharedNodeIdentity" -}}
+CN={{ include "nifi.sharedNodeIdentityCommonName" . }}{{ include "nifi.nodeOU" . }}
+{{- end -}}
+
 {{- define "apache-nifi.certManagerIssuerRef" -}}
 {{- $ext := default (dict) .Values.certManager.issuerRef -}}
 {{- if ne (default "" $ext.name) "" -}}
@@ -219,18 +269,25 @@ Result:
 
 {{/*
 nifi.effectiveSecretsMode
-Returns the active secretsMode string, with backward-compatibility for
-deprecated boolean flags (evaluated in priority order):
+Returns the active secretsMode string (evaluated in priority order):
   1. properties.secretsMode (non-empty string) — taken as-is.
-  2. properties.UseK8sSecrets: true             — maps to "file-dir" (deprecated in 2.8.0).
+  2. properties.UseK8sSecrets: true             — hard-fails (removed in 2.10).
   3. Otherwise returns "none".
 */}}
 {{- define "nifi.effectiveSecretsMode" -}}
 {{- $sm := default "" .Values.properties.secretsMode -}}
-{{- if $sm -}}
+{{- if .Values.properties.UseK8sSecrets -}}
+{{- fail "properties.UseK8sSecrets was removed in 2.10. Use properties.secretsMode: directory instead." -}}
+{{- else if eq $sm "env" -}}
+{{- fail "properties.secretsMode=env was removed in 2.10. Use directory or singlefile." -}}
+{{- else if and $sm (not (has $sm (list "none" "directory" "singlefile" "file-dir" "file-single"))) -}}
+{{- fail (printf "properties.secretsMode=%q is invalid. Allowed values: none, directory, singlefile (legacy aliases: file-dir, file-single)." $sm) -}}
+{{- else if eq $sm "file-dir" -}}
+directory
+{{- else if eq $sm "file-single" -}}
+singlefile
+{{- else if $sm -}}
 {{- $sm -}}
-{{- else if .Values.properties.UseK8sSecrets -}}
-file-dir
 {{- else -}}
 none
 {{- end -}}
@@ -271,20 +328,31 @@ ${INITIAL_ADMIN_IDENTITY}, ${S3_ACCESS_KEY_ID}, ${S3_SECRET_ACCESS_KEY}
 regardless of how secrets are delivered.
 
 Modes (properties.secretsMode):
-  file-dir    – read individual files from properties.secretsFilePath/
-  file-single – source the KEY=VALUE file at secretsFilePath/secretsFile
-  env         – variables already set; nothing emitted
+  directory   – read individual files from properties.secretsFilePath/
+  singlefile  – source the KEY=VALUE file at secretsFilePath/secretsFile
   none        – set from Helm values.yaml literals
 */}}
+{{/*
+nifi.syncPaths
+Returns the combined list of NiFiSync.syncPaths and NiFiSync.additionalSyncPaths
+as a JSON array so callers can do:
+  {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
+This lets override values.yaml add entries via additionalSyncPaths without
+needing to repeat all the chart-default syncPaths.
+*/}}
+{{- define "nifi.syncPaths" -}}
+{{- concat (.Values.NiFiSync.syncPaths | default list) (.Values.NiFiSync.additionalSyncPaths | default list) | toJson -}}
+{{- end -}}
+
 {{/*
 nifi.awsSecretsSyncWait
 Emits a shell block that blocks until the awsSecretsSync sidecar has written
 its readiness sentinel file (outputPath/.aws-secrets-ready).  Only emitted
-when awsSecretsSync.enabled=true and the effective secretsMode is "file-dir",
+when awsSecretsSync.enabled=true and the effective secretsMode is "directory",
 because that is the only case where containers read files from outputPath.
 */}}
 {{- define "nifi.awsSecretsSyncWait" -}}
-{{- if and .Values.awsSecretsSync.enabled (eq (include "nifi.effectiveSecretsMode" .) "file-dir") }}
+{{- if and .Values.awsSecretsSync.enabled (eq (include "nifi.effectiveSecretsMode" .) "directory") }}
           # Wait for awsSecretsSync to complete its initial fetch before reading credential files
           _aws_sentinel={{ printf "%s/.aws-secrets-ready" .Values.awsSecretsSync.outputPath | quote }}
           _aws_timeout=${AWS_SECRETS_WAIT_TIMEOUT:-120}
@@ -306,7 +374,7 @@ because that is the only case where containers read files from outputPath.
 {{- define "nifi.secretsInit" -}}
 {{- $sm := include "nifi.effectiveSecretsMode" . -}}
 {{- $sp := .Values.properties.secretsFilePath -}}
-{{- if eq $sm "file-dir" }}
+{{- if eq $sm "directory" }}
           # ---- secrets: file-dir — load from {{ $sp }}/ ----
           _nifi_sp={{ $sp | quote }}
           NIFI_TLS_KEYSTORE_PASSWORD=$(tr -d '\r\n' < "$_nifi_sp/NIFI_TLS_KEYSTORE_PASSWORD" 2>/dev/null) || true
@@ -315,21 +383,47 @@ because that is the only case where containers read files from outputPath.
           LDAP_MANAGER_DN=$(tr -d '\r\n' < "$_nifi_sp/LDAP_MANAGER_DN" 2>/dev/null) || true
           LDAP_MANAGER_PASSWORD=$(tr -d '\r\n' < "$_nifi_sp/LDAP_MANAGER_PASSWORD" 2>/dev/null) || true
           INITIAL_ADMIN_IDENTITY=$(tr -d '\r\n' < "$_nifi_sp/INITIAL_ADMIN_IDENTITY" 2>/dev/null) || true
-          S3_ACCESS_KEY_ID=$(tr -d '\r\n' < "$_nifi_sp/S3_ACCESS_KEY_ID" 2>/dev/null) || true
-          S3_SECRET_ACCESS_KEY=$(tr -d '\r\n' < "$_nifi_sp/S3_SECRET_ACCESS_KEY" 2>/dev/null) || true
           export NIFI_TLS_KEYSTORE_PASSWORD NIFI_TLS_TRUSTSTORE_PASSWORD NIFI_SENSITIVE_PROPS_KEY
           export LDAP_MANAGER_DN LDAP_MANAGER_PASSWORD INITIAL_ADMIN_IDENTITY
+          {{- if not .Values.NiFiSync.s3Sync.useIRSA }}
+          S3_ACCESS_KEY_ID=$(tr -d '\r\n' < "$_nifi_sp/S3_ACCESS_KEY_ID" 2>/dev/null) || true
+          S3_SECRET_ACCESS_KEY=$(tr -d '\r\n' < "$_nifi_sp/S3_SECRET_ACCESS_KEY" 2>/dev/null) || true
           export S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY
+          {{- end }}
+          {{- $hasAwsCredSecret := false }}
+          {{- if and .Values.VaultNiFiSecrets.enabled (eq (default "" .Values.VaultNiFiSecrets.secretProvider) "vaultSidecar") }}
+          {{- range .Values.VaultNiFiSecrets.secrets }}
+          {{- if eq (default "" .secretMode) "aws-credential" }}
+          {{- $hasAwsCredSecret = true }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- if $hasAwsCredSecret }}
+          # Export AWS credential discovery files from Vault aws-credential mode.
+          # Sanitize filenames (replace dots and dashes with underscores) for valid bash variable names.
+          for _aws_var_file in \
+            "$_nifi_sp/AWS_SHARED_CREDENTIALS_FILE" \
+            "$_nifi_sp/AWS_REGION" \
+            "$_nifi_sp/AWS_CREDENTIAL_TTL" \
+            "$_nifi_sp/AWS_SHARED_CREDENTIALS_FILE_"* \
+            "$_nifi_sp/AWS_REGION_"* \
+            "$_nifi_sp/AWS_CREDENTIAL_TTL_"*; do
+            [ -f "$_aws_var_file" ] || continue
+            _aws_var_name=$(basename "$_aws_var_file" | tr '.-' '__')
+            _aws_var_val=$(tr -d '\r\n' < "$_aws_var_file" 2>/dev/null) || true
+            [ -n "$_aws_var_val" ] || continue
+            export "${_aws_var_name}=${_aws_var_val}"
+          done
+          unset _aws_var_file _aws_var_name _aws_var_val
+          {{- end }}
           unset _nifi_sp
           # ---- end secrets ----
-{{- else if eq $sm "file-single" }}
+{{- else if eq $sm "singlefile" }}
           # ---- secrets: file-single — source {{ $sp }}/{{ .Values.properties.secretsFile }} ----
           set -a
           . {{ printf "%s/%s" $sp .Values.properties.secretsFile | quote }}
           set +a
           # ---- end secrets ----
-{{- else if eq $sm "env" }}
-          # ---- secrets: env mode — variables expected already in environment ----
 {{- else }}
           # ---- secrets: none mode — values from Helm values.yaml ----
           NIFI_TLS_KEYSTORE_PASSWORD={{ .Values.certManager.keystorePasswd | quote }}

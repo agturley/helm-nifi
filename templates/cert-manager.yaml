@@ -21,9 +21,11 @@ spec:
   duration: {{ $.Values.certManager.caDuration }}
   renewBefore: 5m1s
   commonName: {{ template "apache-nifi.fullname" $ }}-ca.{{ $.Release.Namespace }}.svc.{{ $.Values.certManager.clusterDomain }}
+{{- if $.Values.certManager.nodeOU }}
   subject:
     organizationalUnits:
-    - NIFI
+    - {{ $.Values.certManager.nodeOU }}
+{{- end }}
   secretName: {{ template "apache-nifi.fullname" $ }}-ca
   privateKey:
     algorithm: RSA
@@ -53,9 +55,11 @@ metadata:
 spec:
   duration: {{ $.Values.certManager.certDuration }}
   commonName: {{ include "nifi.nodeCN" (dict "ctx" $ "node" .) }}
+{{- if $.Values.certManager.nodeOU }}
   subject:
     organizationalUnits:
-    - NIFI
+    - {{ $.Values.certManager.nodeOU }}
+{{- end }}
   secretName: {{ template "apache-nifi.fullname" $ }}-{{ . }}
   privateKey:
     rotationPolicy: Always
@@ -168,9 +172,11 @@ metadata:
 spec:
   duration: {{ $.Values.certManager.certDuration }}
   commonName: {{ template "apache-nifi.fullname" $ }}-monitor
+{{- if $.Values.certManager.nodeOU }}
   subject:
     organizationalUnits:
-    - NIFI
+    - {{ $.Values.certManager.nodeOU }}
+{{- end }}
   secretName: {{ template "apache-nifi.fullname" $ }}-monitor
   privateKey:
     rotationPolicy: Always

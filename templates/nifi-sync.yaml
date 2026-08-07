@@ -40,13 +40,41 @@ data:
     # Default paths
     NIFI_HOME = Path(os.getenv("NIFI_HOME", "/opt/nifi/nifi-current"))
     CONF_DIR = Path(os.getenv("CONF_DIR", "/opt/nifi/data"))
+
+    # Load credentials from the configured secrets source so INITIAL_ADMIN_IDENTITY,
+    # and any other relevant vars, are available regardless of secretsMode.
+    _secrets_mode = os.getenv("SECRETS_MODE", "none").strip().lower()
+    _secrets_path = os.getenv("SECRETS_PATH", "/opt/nifi/secrets").strip()
+    _secrets_file = os.getenv("SECRETS_FILE", "credentials.env").strip()
+    if _secrets_mode == "directory":
+        for _key in ("INITIAL_ADMIN_IDENTITY", "LDAP_MANAGER_DN", "LDAP_MANAGER_PASSWORD"):
+            _fpath = Path(_secrets_path) / _key
+            if _fpath.exists():
+                _val = _fpath.read_text().strip()
+                if _val:
+                    os.environ[_key] = _val
+                    logging.debug(f"Loaded {_key} from {_fpath}")
+    elif _secrets_mode == "singlefile":
+        _envfile = Path(_secrets_path) / _secrets_file
+        if _envfile.exists():
+            for _line in _envfile.read_text().splitlines():
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _v = _line.split("=", 1)
+                _k, _v = _k.strip(), _v.strip()
+                if _k and _k not in os.environ:
+                    os.environ[_k] = _v
+                    logging.debug(f"Loaded {_k} from {_envfile}")
+    # (none mode: env vars are set by Helm values via the container env: block)
     BACKUP_DIR = NIFI_HOME / "auth-conf" / "backup"
     USERS_XML_PATH = NIFI_HOME / "auth-conf/users.xml"
     AUTH_XML_PATH = NIFI_HOME / "auth-conf/authorizations.xml"
     FLOW_JSON_GZ_PATH = CONF_DIR / "flow.json.gz"
     ROOT_PGID_CACHE = NIFI_HOME / "auth-conf/rootpgid"
-    GROUP_TRACK_FILE = NIFI_HOME / "auth-conf" / "nifi-sync_external_groups.json"
-    USER_TRACK_FILE  = NIFI_HOME / "auth-conf" / "nifi-sync_managed_users.json"
+    GROUP_TRACK_FILE  = NIFI_HOME / "auth-conf" / "nifi-sync_external_groups.json"
+    USER_TRACK_FILE   = NIFI_HOME / "auth-conf" / "nifi-sync_managed_users.json"
+    ADMIN_TRACK_FILE  = NIFI_HOME / "auth-conf" / "nifi-sync_initial_admin.txt"
 
     # Track per-file changes
     changed_users = False
@@ -57,6 +85,13 @@ data:
     MONITORING_USER = 'CN={{ template "apache-nifi.fullname" $ }}-monitor{{ include "nifi.nodeOU" $ }}'
     REPLICA_COUNT = {{ .Values.replicaCount }}
     NODE_USER_TEMPLATE = 'CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" "{i}") }}{{ include "nifi.nodeOU" $ }}'
+    {{- if eq (include "nifi.sharedNodeIdentityMappingEnabled" .) "true" }}
+    # Shared identity used by all nodes after cert-manager identity mapping.
+    # Must match nifi.security.identity.mapping.value.nifi_nodes in nifi.properties.
+    SHARED_NODE_IDENTITY = '{{ include "nifi.sharedNodeIdentity" . }}'
+    {{- else }}
+    SHARED_NODE_IDENTITY = None
+    {{- end }}
 
     # Namespace for deterministic UUID5
     default_namespace = uuid.uuid5(uuid.NAMESPACE_DNS, "nifi-sync")
@@ -172,6 +207,11 @@ data:
         pretty = reparsed.toprettyxml(indent="  ")
         return "\n".join([line for line in pretty.splitlines() if line.strip()])
 
+    def strip_namespaces(root: ET.Element) -> None:
+        for el in root.iter():
+            if isinstance(el.tag, str) and "}" in el.tag:
+                el.tag = el.tag.split("}", 1)[1]
+
     def get_root_pg_id() -> str | None:
         if ROOT_PGID_CACHE.exists():
             pgid = ROOT_PGID_CACHE.read_text().strip()
@@ -191,6 +231,7 @@ data:
         if USERS_XML_PATH.exists():
             tree = ET.parse(USERS_XML_PATH)
             root = tree.getroot()
+            strip_namespaces(root)
 
             # Consolidate multiple <users> elements into one — caused by the
             # empty-element-is-falsy bug where `root.find("users") or
@@ -334,7 +375,7 @@ data:
 
         if os.getenv("RESET_AUTH_FILES", "").lower() in ("1", "true", "yes"):
             logging.warning("RESET_AUTH_FILES is set — wiping auth files for a clean slate (debug only)")
-            for path in (USERS_XML_PATH, AUTH_XML_PATH, GROUP_TRACK_FILE, USER_TRACK_FILE, ROOT_PGID_CACHE):
+            for path in (USERS_XML_PATH, AUTH_XML_PATH, GROUP_TRACK_FILE, USER_TRACK_FILE, ADMIN_TRACK_FILE, ROOT_PGID_CACHE):
                 if path.exists():
                     path.unlink()
                     logging.warning(f"Deleted {path}")
@@ -350,6 +391,24 @@ data:
         # always exists in users.xml. NiFi only bootstraps this on a truly fresh
         # start (no users.xml), so policysync must keep it present.
         initial_admin = os.getenv("INITIAL_ADMIN_IDENTITY", "").strip()
+
+        # Detect and remove a stale initial admin when INITIAL_ADMIN_IDENTITY changes.
+        # The general purge (removed_users = old_users - current_users) only catches
+        # identities that policysync itself previously tracked.  An admin bootstrapped
+        # by NiFi on first start may never appear in USER_TRACK_FILE, so we keep a
+        # dedicated one-line tracker just for the initial admin identity.
+        prev_admin = ADMIN_TRACK_FILE.read_text().strip() if ADMIN_TRACK_FILE.exists() else ""
+        if prev_admin and prev_admin != initial_admin:
+            logging.info(f"INITIAL_ADMIN_IDENTITY changed from '{prev_admin}' to '{initial_admin}'; removing stale entry")
+            old_uid = generate_id("user", prev_admin)
+            _users_elem = users_root.find("users")
+            if _users_elem is not None:
+                old_user_el = _users_elem.find(f"./user[@identifier='{old_uid}']")
+                if old_user_el is not None:
+                    _users_elem.remove(old_user_el)
+                    changed_users = True
+                    logging.info(f"Removed stale initial admin '{prev_admin}' ({old_uid}) from users.xml")
+
         if initial_admin:
             ensure_user(users_root, initial_admin, user_ids)
             current_users.add(initial_admin)
@@ -368,14 +427,6 @@ data:
                     if grp_elem is not None and not grp_elem.find(f"./user[@identifier='{uid}']"):
                         ET.SubElement(grp_elem, "user", {"identifier": uid})
                         current_users.add(usr)
-        if not root_pg_id:
-            logging.error("Cannot resolve root process group ID. Exiting.")
-            return
-
-        # Ensure the monitoring user exists and is tracked before purges
-        mon_uid = ensure_user(users_root, MONITORING_USER, user_ids)
-        current_users.add(MONITORING_USER)
-
         # Managed groups in users.xml
         if ENABLE_MANAGED_GROUPS:
             for grp, members in managed_groups.items():
@@ -393,106 +444,27 @@ data:
             uname = NODE_USER_TEMPLATE.format(i=idx)
             current_users.add(uname)
 
-        # Load or initialize authorizations.xml
-        if AUTH_XML_PATH.exists():
-            auth_tree = ET.parse(AUTH_XML_PATH)
-            auth_root = auth_tree.getroot()
-        else:
-            auth_root = ET.Element("authorizations")
-            auth_tree = ET.ElementTree(auth_root)
-        policies_elem = auth_root.find("policies") or ET.SubElement(auth_root, "policies")
+        # Shared mapped node identity (when shared-node identity mapping is enabled)
+        shared_node_uid = None
+        if SHARED_NODE_IDENTITY:
+            shared_identity_exists = SHARED_NODE_IDENTITY in user_ids
+            shared_node_uid = ensure_user(users_root, SHARED_NODE_IDENTITY, user_ids)
+            current_users.add(SHARED_NODE_IDENTITY)
+            if shared_identity_exists:
+                logging.debug(f"Shared node identity already present '{SHARED_NODE_IDENTITY}'")
+            else:
+                logging.info(f"Ensured shared node identity '{SHARED_NODE_IDENTITY}'")
 
-        # Assign per-node-user permissions
-        node_permissions = [
-            ("R", "/data/process-groups/ROOT_PG"),
-            ("W", "/data/process-groups/ROOT_PG"),
-            ("R", "/site-to-site"),
-            ("R", "/controller"),
-            ("R", "/system"),
-            ("W", "/proxy"),
-        ]
-        for idx, uid in enumerate(node_uids):
-            uname = NODE_USER_TEMPLATE.format(i=idx)
-            for action, resource in node_permissions:
-                add_policy(
-                    policies_elem,
-                    action,
-                    resource.replace("ROOT_PG", root_pg_id),
-                    [uid],
-                    [],
-                    [uname],
-                    []
-                )
-
-        # Apply managed group policies
-        if ENABLE_MANAGED_GROUPS:
-            for grp, role in managed_group_roles.items():
-                gid = ensure_group(users_root, grp, group_ids)
-                for action, resource in role_privileges.get(role, []):
-                    add_policy(
-                        policies_elem,
-                        action,
-                        resource.replace("ROOT_PG", root_pg_id),
-                        [user_ids[m] for m in managed_groups.get(grp, []) if m in user_ids],
-                        [gid],
-                        [m for m in managed_groups.get(grp, []) if m in user_ids],
-                        [grp]
-                    )
-
-        # Apply external LDAP group policies
-        for grp, role in external_group_roles.items():
-            logging.info(f"Processing LDAP group '{grp}' with role '{role}'")
-            gid = generate_group_uuid(grp)
-            for action, resource in role_privileges.get(role, []):
-                add_policy(
-                    policies_elem,
-                    action,
-                    resource.replace("ROOT_PG", root_pg_id),
-                    [],
-                    [gid],
-                    [],
-                    [grp]
-                )
-
-        # Purge removed managed users
+        # Compute removed users/groups now — needed for both users.xml cleanup
+        # (always) and policy purge (only when root_pg_id is available).
         old_users = load_tracked_users()
         removed_users = old_users - current_users
-        if removed_users:
-            logging.info(f"Detected removed managed users: {removed_users}")
-            for usr in removed_users:
-                uid = generate_id("user", usr)
-                for policy in list(policies_elem.findall("policy")):
-                    for uel in policy.findall("user"):
-                        if uel.attrib.get("identifier") == uid:
-                            logging.info(f"Removing user '{usr}' ({uid}) from policy {policy.attrib['action']}:{policy.attrib['resource']}")
-                            policy.remove(uel)
-                            changed_auth = True
-                    if not policy.findall("group") and not policy.findall("user"):
-                        logging.info(f"Removing empty policy {policy.attrib['action']}:{policy.attrib['resource']}")
-                        policies_elem.remove(policy)
-                        changed_auth = True
-
-        # Purge removed external groups
         old_groups = load_tracked_groups()
         removed_groups = old_groups - set(external_group_roles.keys())
-        if removed_groups:
-            logging.info(f"Detected removed LDAP groups: {removed_groups}")
-            for grp in removed_groups:
-                gid = generate_group_uuid(grp)
-                for policy in list(policies_elem.findall("policy")):
-                    for g in policy.findall("group"):
-                        if g.attrib.get("identifier") == gid:
-                            logging.info(f"Removing group '{grp}' ({gid}) from policy {policy.attrib['action']}:{policy.attrib['resource']}")
-                            policy.remove(g)
-                            changed_auth = True
-                    if not policy.findall("group") and not policy.findall("user"):
-                        logging.info(f"Removing empty policy {policy.attrib['action']}:{policy.attrib['resource']}")
-                        policies_elem.remove(policy)
-                        changed_auth = True
-        # ——— Also remove the user entry itself from users.xml ———
+
+        # ——— Remove stale entries from users.xml (always, no root PG ID needed) ———
         users_elem  = users_root.find("users")
         groups_elem = users_root.find("groups")
-
         for usr in removed_users:
             uid = generate_id("user", usr)
             # 1) Remove the <user> element
@@ -501,7 +473,6 @@ data:
                 users_elem.remove(user_el)
                 changed_users = True
                 logging.info(f"Removed user '{usr}' ({uid}) from users.xml")
-
             # 2) Remove them from any <group> memberships
             for grp_el in (groups_elem.findall("group") if groups_elem is not None else []):
                 member_el = grp_el.find(f"./user[@identifier='{uid}']")
@@ -511,21 +482,135 @@ data:
                     logging.info(
                         f"Removed user '{usr}' ({uid}) from group '{grp_el.attrib['name']}'"
                     )
-        # Monitoring user
-        mon_uid = ensure_user(users_root, MONITORING_USER, user_ids)
-        current_users.add(MONITORING_USER)
-        {{- if .Values.metrics.prometheus.enabled }}
-        for action, resource in role_privileges["monitoring"]:
-            add_policy(
-                policies_elem,
-                action,
-                resource.replace("ROOT_PG", root_pg_id),
-                [mon_uid],
-                [],
-                [MONITORING_USER],
-                []
+
+        if root_pg_id:
+            # Load or initialize authorizations.xml
+            if AUTH_XML_PATH.exists():
+                auth_tree = ET.parse(AUTH_XML_PATH)
+                auth_root = auth_tree.getroot()
+                strip_namespaces(auth_root)
+            else:
+                auth_root = ET.Element("authorizations")
+                auth_tree = ET.ElementTree(auth_root)
+            policies_elem = auth_root.find("policies") or ET.SubElement(auth_root, "policies")
+
+            # Assign per-node-user permissions
+            node_permissions = [
+                ("R", "/data/process-groups/ROOT_PG"),
+                ("W", "/data/process-groups/ROOT_PG"),
+                ("R", "/site-to-site"),
+                ("R", "/controller"),
+                ("R", "/system"),
+                ("W", "/proxy"),
+            ]
+            for idx, uid in enumerate(node_uids):
+                uname = NODE_USER_TEMPLATE.format(i=idx)
+                for action, resource in node_permissions:
+                    add_policy(
+                        policies_elem,
+                        action,
+                        resource.replace("ROOT_PG", root_pg_id),
+                        [uid],
+                        [],
+                        [uname],
+                        []
+                    )
+
+            # Grant the same node permissions to the shared mapped identity
+            if shared_node_uid:
+                for action, resource in node_permissions:
+                    add_policy(
+                        policies_elem,
+                        action,
+                        resource.replace("ROOT_PG", root_pg_id),
+                        [shared_node_uid],
+                        [],
+                        [SHARED_NODE_IDENTITY],
+                        []
+                    )
+
+            # Apply managed group policies
+            if ENABLE_MANAGED_GROUPS:
+                for grp, role in managed_group_roles.items():
+                    gid = ensure_group(users_root, grp, group_ids)
+                    for action, resource in role_privileges.get(role, []):
+                        add_policy(
+                            policies_elem,
+                            action,
+                            resource.replace("ROOT_PG", root_pg_id),
+                            [user_ids[m] for m in managed_groups.get(grp, []) if m in user_ids],
+                            [gid],
+                            [m for m in managed_groups.get(grp, []) if m in user_ids],
+                            [grp]
+                        )
+
+            # Apply external LDAP group policies
+            for grp, role in external_group_roles.items():
+                logging.info(f"Processing LDAP group '{grp}' with role '{role}'")
+                gid = generate_group_uuid(grp)
+                for action, resource in role_privileges.get(role, []):
+                    add_policy(
+                        policies_elem,
+                        action,
+                        resource.replace("ROOT_PG", root_pg_id),
+                        [],
+                        [gid],
+                        [],
+                        [grp]
+                    )
+
+            # Purge removed managed users from policies
+            if removed_users:
+                logging.info(f"Detected removed managed users: {removed_users}")
+                for usr in removed_users:
+                    uid = generate_id("user", usr)
+                    for policy in list(policies_elem.findall("policy")):
+                        for uel in policy.findall("user"):
+                            if uel.attrib.get("identifier") == uid:
+                                logging.info(f"Removing user '{usr}' ({uid}) from policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                                policy.remove(uel)
+                                changed_auth = True
+                        if not policy.findall("group") and not policy.findall("user"):
+                            logging.info(f"Removing empty policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                            policies_elem.remove(policy)
+                            changed_auth = True
+
+            # Purge removed external groups from policies
+            if removed_groups:
+                logging.info(f"Detected removed LDAP groups: {removed_groups}")
+                for grp in removed_groups:
+                    gid = generate_group_uuid(grp)
+                    for policy in list(policies_elem.findall("policy")):
+                        for g in policy.findall("group"):
+                            if g.attrib.get("identifier") == gid:
+                                logging.info(f"Removing group '{grp}' ({gid}) from policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                                policy.remove(g)
+                                changed_auth = True
+                        if not policy.findall("group") and not policy.findall("user"):
+                            logging.info(f"Removing empty policy {policy.attrib['action']}:{policy.attrib['resource']}")
+                            policies_elem.remove(policy)
+                            changed_auth = True
+
+            # Monitoring user policies
+            mon_uid = user_ids[MONITORING_USER]
+            {{- if .Values.metrics.prometheus.enabled }}
+            for action, resource in role_privileges["monitoring"]:
+                add_policy(
+                    policies_elem,
+                    action,
+                    resource.replace("ROOT_PG", root_pg_id),
+                    [mon_uid],
+                    [],
+                    [MONITORING_USER],
+                    []
+                )
+            {{- end }}
+        else:
+            logging.warning(
+                "flow.json.gz not found — root process group ID unknown on first boot. "
+                "users.xml will be written but authorizations.xml will be skipped. "
+                "Auth policies will be applied on the next pod restart after NiFi has started."
             )
-        {{- end }}
 
         # Backup & write
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -553,6 +638,8 @@ data:
         # Persist trackers
         save_track(USER_TRACK_FILE, current_users)
         save_track(GROUP_TRACK_FILE, set(external_group_roles.keys()))
+        if initial_admin:
+            ADMIN_TRACK_FILE.write_text(initial_admin)
 
     if __name__ == "__main__":
         main()
@@ -1127,10 +1214,17 @@ data:
 
     Configuration is read from the environment so the surrounding shell keeps
     owning orchestration (loops, vault preamble, secret creation):
-      S3_BUCKET, S3_ENDPOINT, AWS_DEFAULT_REGION (or S3_REGION)
-      USE_IRSA, S3_INSECURE
+      S3_BUCKET          bucket name, or "bucket/embedded/prefix" to scope all
+                         keys under a sub-prefix without changing the shell scripts
+      S3_ENDPOINT        custom endpoint URL (MinIO, VPC endpoint; omit for AWS)
+      AWS_DEFAULT_REGION (or S3_REGION) — default "us-east-1"
+      USE_IRSA           "true" to use IRSA/instance-profile credential chain
+      S3_INSECURE        "true" to skip TLS verification (self-signed MinIO)
       S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN (when not IRSA)
+      S3_WAIT_INTERVAL   seconds between wait-ready retries (default 30)
       instanceName, POD_NAME                          (flow-backup)
+      FLOW_PATH          path to flow.json.gz (default /opt/nifi/data/flow.json.gz)
+      ARCHIVE_PATH       path to archive dir  (default /opt/nifi/data/archive)
       RETENTION_ENABLED, RETENTION_DRY_RUN            (flow-backup)
       FLOW_KEEP_DAYS, FLOW_MAX_VERSIONS               (flow-backup)
       ARCHIVE_RETENTION_ENABLED, ARCHIVE_KEEP_DAYS    (flow-backup)
@@ -1183,16 +1277,33 @@ data:
             return default
 
 
-    def bucket_name():
-        bkt = os.environ.get("S3_BUCKET")
-        if not bkt:
+    def bucket_and_prefix():
+        """Return (bucket, embedded_prefix) split from S3_BUCKET.
+        S3_BUCKET may be set to just a bucket name ("mybucket") or to a
+        bucket/prefix pair ("mybucket/some/prefix").  boto3 requires the
+        bucket name to contain no slashes, so we split once and prepend any
+        extra path segments to every key/prefix passed to the S3 API.
+        """
+        raw = os.environ.get("S3_BUCKET", "")
+        if not raw:
             log("S3_BUCKET is not set", "ERROR")
             sys.exit(1)
+        parts = raw.split("/", 1)
+        bkt = parts[0]
+        pfx = parts[1].strip("/") if len(parts) > 1 else ""
+        return bkt, pfx
+
+    def bucket_name():
+        bkt, _ = bucket_and_prefix()
         return bkt
 
 
-    def norm_prefix(prefix):
-        return (prefix or "").strip("/")
+    def norm_prefix(prefix, embedded=""):
+        """Strip leading/trailing slashes; prepend any embedded bucket prefix."""
+        p = (prefix or "").strip("/")
+        if embedded:
+            p = embedded + "/" + p if p else embedded
+        return p
 
 
     def make_client(announce=False):
@@ -1204,6 +1315,7 @@ data:
         )
         insecure = env_bool("S3_INSECURE", False)
         use_irsa = env_bool("USE_IRSA", False)
+        ca_bundle = os.environ.get("AWS_CA_BUNDLE") or None
 
         s3_opts = {}
         # Custom endpoints (MinIO, VPC endpoints) generally require path-style
@@ -1216,10 +1328,18 @@ data:
             retries={"max_attempts": 5, "mode": "standard"},
             s3=s3_opts,
         )
+        # When a CA bundle path is available, pass it explicitly so botocore
+        # uses it regardless of the system trust store.
+        if insecure:
+            verify = False
+        elif ca_bundle:
+            verify = ca_bundle
+        else:
+            verify = True
         kwargs = dict(
             endpoint_url=endpoint,
             region_name=region,
-            verify=not insecure,
+            verify=verify,
             config=cfg,
         )
         if use_irsa:
@@ -1312,7 +1432,7 @@ data:
 
     # ---------------------------------------------------------------- commands
     def cmd_wait_ready(client, args):
-        bucket = bucket_name()
+        bucket, _ = bucket_and_prefix()
         interval = env_int("S3_WAIT_INTERVAL", 30) or 30
         while True:
             try:
@@ -1329,23 +1449,23 @@ data:
 
 
     def cmd_prefix_exists(client, args):
-        bucket = bucket_name()
-        prefix = norm_prefix(args.remote)
+        bucket, bpfx = bucket_and_prefix()
+        prefix = norm_prefix(args.remote, bpfx)
         resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
         return 0 if resp.get("KeyCount", 0) > 0 else 1
 
 
     def cmd_put_placeholder(client, args):
-        bucket = bucket_name()
-        key = "%s/%s" % (norm_prefix(args.remote), PLACEHOLDER)
+        bucket, bpfx = bucket_and_prefix()
+        key = "%s/%s" % (norm_prefix(args.remote, bpfx), PLACEHOLDER)
         client.put_object(Bucket=bucket, Key=key, Body=b"placeholder\n")
         log("Created placeholder s3://%s/%s" % (bucket, key))
         return 0
 
 
     def cmd_mirror_down(client, args):
-        bucket = bucket_name()
-        prefix = norm_prefix(args.remote)
+        bucket, bpfx = bucket_and_prefix()
+        prefix = norm_prefix(args.remote, bpfx)
         local = args.local
         os.makedirs(local, exist_ok=True)
         count = 0
@@ -1428,24 +1548,39 @@ data:
 
 
     def cmd_mirror_up(client, args):
-        bucket = bucket_name()
-        prefix = norm_prefix(args.remote)
+        bucket, bpfx = bucket_and_prefix()
+        prefix = norm_prefix(args.remote, bpfx)
         local = args.local
+        overwrite = getattr(args, "overwrite", False)
         if not os.path.isdir(local):
             log("mirror-up source %s not found; nothing to do" % local)
             return 0
+        # Pre-fetch existing S3 keys so we can skip already-uploaded files
+        # when overwrite=False (one paginated LIST beats re-uploading every file).
+        existing_keys = set()
+        if not overwrite:
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix + "/"):
+                for obj in page.get("Contents", []):
+                    existing_keys.add(obj["Key"])
         count = 0
+        skipped = 0
         for root, _dirs, files in os.walk(local):
             for name in files:
                 full = os.path.join(root, name)
                 rel = os.path.relpath(full, local).replace(os.sep, "/")
                 key = "%s/%s" % (prefix, rel)
+                if not overwrite and key in existing_keys:
+                    skipped += 1
+                    continue
                 log("  uploading %s -> s3://%s/%s" % (full, bucket, key))
                 client.upload_file(full, bucket, key, Config=TRANSFER)
                 count += 1
         if count:
             log("Uploaded %d file(s) from %s to s3://%s/%s" % (count, local, bucket, prefix))
-        else:
+        if skipped:
+            log("Skipped %d already-existing file(s) in s3://%s/%s" % (skipped, bucket, prefix))
+        if not count and not skipped:
             log("Nothing to upload from %s" % local)
         return 0
 
@@ -1479,7 +1614,6 @@ data:
 
 
     def cmd_flow_backup(client, args):
-        bucket = bucket_name()
         instance = os.environ.get("instanceName")
         pod = os.environ.get("POD_NAME")
         if not instance or not pod:
@@ -1488,10 +1622,13 @@ data:
 
         flow_path = os.environ.get("FLOW_PATH", "/opt/nifi/data/flow.json.gz")
         archive_path = os.environ.get("ARCHIVE_PATH", "/opt/nifi/data/archive")
-        base = "%s/backup/%s" % (instance, pod)
-        remote_current = "%s/flow.json.gz" % base
-        versions_prefix = "%s/flow-backup" % base
-        remote_archive = "%s/archive" % base
+        bucket, bpfx = bucket_and_prefix()
+        # raw (un-prefixed) base — cmd_mirror_up will apply bpfx itself
+        base_raw = "%s/backup/%s" % (instance, pod)
+        # prefixed keys for direct boto3 API calls
+        remote_current  = norm_prefix(base_raw + "/flow.json.gz",  bpfx)
+        versions_prefix = norm_prefix(base_raw + "/flow-backup",   bpfx)
+        remote_archive  = norm_prefix(base_raw + "/archive",       bpfx)
 
         # ---------- flow.json.gz upload (only when changed) ----------
         if os.path.isfile(flow_path):
@@ -1533,7 +1670,11 @@ data:
         if os.path.isdir(archive_path):
             log("Syncing NiFi archive directory to %s" % remote_archive)
             mirror_args = argparse.Namespace(
-                local=archive_path, remote=remote_archive, overwrite=True
+                # Pass the un-prefixed path; cmd_mirror_up will apply bpfx via
+                # norm_prefix(args.remote, bpfx) — avoids double-prefixing.
+                # overwrite=False: archive files are write-once; skip existing
+                # keys to avoid re-uploading the full archive every run.
+                local=archive_path, remote=base_raw + "/archive", overwrite=False
             )
             try:
                 cmd_mirror_up(client, mirror_args)
@@ -1546,6 +1687,104 @@ data:
         prune_flow_backups(client, bucket, versions_prefix)
         prune_remote_archive(client, bucket, remote_archive)
         return 0
+
+
+    def cmd_flow_restore(client, args):
+        """Check for a restore trigger at <instance>/restore/<pod>/flow.json.gz.
+
+        If present:
+          1. Archive the current flow.json.gz into the versioned backup path
+             (same convention as flow-backup) so the restore is reversible.
+          2. Download the restore file and atomically replace flow.json.gz.
+          3. Delete the S3 restore key so it fires only once.
+
+        Returns:
+          0  — no restore pending (normal idle poll)
+          2  — restore completed; caller should restart the pod
+          1  — error
+        """
+        instance = os.environ.get("instanceName")
+        pod = os.environ.get("POD_NAME")
+        if not instance or not pod:
+            log("instanceName and POD_NAME are required for flow-restore", "ERROR")
+            return 1
+
+        flow_path = os.environ.get("FLOW_PATH", "/opt/nifi/data/flow.json.gz")
+        bucket, bpfx = bucket_and_prefix()
+        # Mirror the same base path layout as flow-backup so pre-restore
+        # archives land in the same versioned bucket the operator already monitors.
+        base_raw        = "%s/backup/%s" % (instance, pod)
+        versions_prefix = norm_prefix(base_raw + "/flow-backup",  bpfx)
+        remote_current  = norm_prefix(base_raw + "/flow.json.gz", bpfx)
+        restore_key     = norm_prefix("%s/restore/%s/flow.json.gz" % (instance, pod), bpfx)
+
+        # ---- check for restore trigger ----
+        try:
+            client.head_object(Bucket=bucket, Key=restore_key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return 0  # nothing pending
+            raise
+
+        log("Restore trigger detected at s3://%s/%s" % (bucket, restore_key))
+
+        # ---- 1. archive current flow before overwriting ----
+        if os.path.isfile(flow_path):
+            local_hash = sha256_file(flow_path)
+            stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            versioned = "%s/%s-pre-restore-flow.json.gz" % (versions_prefix, stamp)
+            log("Archiving current flow.json.gz to s3://%s/%s" % (bucket, versioned))
+            try:
+                client.upload_file(
+                    flow_path, bucket, versioned,
+                    ExtraArgs={"Metadata": {"sha256": local_hash}},
+                    Config=TRANSFER,
+                )
+                # Also refresh the "current" backup pointer so flow-backup
+                # sees the pre-restore state on its next hash comparison.
+                client.upload_file(
+                    flow_path, bucket, remote_current,
+                    ExtraArgs={"Metadata": {"sha256": local_hash}},
+                    Config=TRANSFER,
+                )
+                log("Pre-restore backup complete.")
+            except (ClientError, BotoCoreError) as exc:
+                log("Failed to back up current flow before restore (%s); aborting." % exc, "ERROR")
+                return 1
+        else:
+            log("No existing flow.json.gz at %s; skipping pre-restore backup." % flow_path)
+
+        # ---- 2. download restore file ----
+        tmp_path = flow_path + ".restore-tmp"
+        try:
+            log("Downloading restore flow from s3://%s/%s" % (bucket, restore_key))
+            client.download_file(bucket, restore_key, tmp_path, Config=TRANSFER)
+        except (ClientError, BotoCoreError) as exc:
+            log("Failed to download restore file (%s)" % exc, "ERROR")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return 1
+
+        if not os.path.getsize(tmp_path):
+            log("Downloaded restore file is empty; aborting restore.", "ERROR")
+            os.remove(tmp_path)
+            return 1
+
+        os.makedirs(os.path.dirname(os.path.abspath(flow_path)), exist_ok=True)
+        os.rename(tmp_path, flow_path)
+        log("flow.json.gz replaced with restore file.")
+
+        # ---- 3. delete S3 restore trigger ----
+        try:
+            client.delete_object(Bucket=bucket, Key=restore_key)
+            log("Deleted S3 restore trigger s3://%s/%s" % (bucket, restore_key))
+        except (ClientError, BotoCoreError) as exc:
+            log("Warning: failed to delete restore trigger (%s); it may fire again." % exc, "WARNING")
+
+        return 2  # signal caller to restart the pod
 
 
     def prune_flow_backups(client, bucket, versions_prefix):
@@ -1642,6 +1881,7 @@ data:
         p_up.set_defaults(func=cmd_mirror_up)
 
         sub.add_parser("flow-backup").set_defaults(func=cmd_flow_backup)
+        sub.add_parser("flow-restore").set_defaults(func=cmd_flow_restore)
         return parser
 
 

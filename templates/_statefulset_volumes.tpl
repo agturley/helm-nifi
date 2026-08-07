@@ -33,10 +33,10 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
           name: vault-sidecar-config
       - name: secretfspath
         emptyDir: {} 
-      - name: secret-env-script
+      - name: vault-scripts
         configMap:
-          name: secret-env-script
-          defaultMode: 0440              
+          name: {{ include "apache-nifi.fullname" . }}-vault-scripts
+          defaultMode: 0755
       {{- end }}
 
       #END VaultSecretVolumes
@@ -51,7 +51,7 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
           name: {{ .Release.Name }}-aws-secrets-sync-script
           defaultMode: 0550
       {{- end }}
-      {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (ne (include "nifi.effectiveSecretsMode" .) "env") }}
+      {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") }}
       - name: k8s-secrets
         secret:
           secretName: {{ .Values.properties.secretsName }}
@@ -134,19 +134,43 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
         emptyDir:
           medium: Memory
           sizeLimit: {{ .Values.persistence.provenanceRepoStorage.size }}
-    {{- end }}        
-{{- if .Values.certManager.enabled }}
+    {{- end }}
+{{ if .Values.certManager.enabled }}
+  {{- $caSecrets := default .Values.certManager.caSecrets .Values.caSecrets }}
       - name: secret-reader-token
         secret:
           secretName: {{ template "apache-nifi.fullname" $ }}-secret-reader-token
       - name: tls
         emptyDir: {}
-      {{- range .Values.certManager.caSecrets }}
+      {{- range $caSecrets }}
       - name: {{ include "apache-nifi.fullname" $ }}-{{ . }}
         secret:
           secretName: {{ . }}
       {{- end }}
-{{- /* if .Values.certManager.enabled */}}{{ end }}
+{{- /* if .Values.certManager.enabled */}}
+{{- end }}
+{{- $vaultVals := .Values.VaultNiFiSecrets -}}
+{{- $vaultCaSecrets := .Values.caSecrets -}}
+{{- $vaultCaSecretName := default "" $vaultVals.vaultSidecar.caSecretName -}}
+{{- if and (eq $vaultCaSecretName "") (gt (len $vaultCaSecrets) 0) -}}
+{{- $vaultCaSecretName = index $vaultCaSecrets 0 -}}
+{{- end -}}
+{{- if and $vaultVals.enabled (eq (default "" $vaultVals.secretProvider) "vaultSidecar") (ne $vaultCaSecretName "") (not .Values.certManager.enabled) }}
+      - name: {{ include "apache-nifi.fullname" $ }}-{{ $vaultCaSecretName }}
+        secret:
+          secretName: {{ $vaultCaSecretName }}
+{{- end }}
+{{- if ne $vaultCaSecretName "" }}
+      - name: ca-secret-files
+        secret:
+          secretName: {{ $vaultCaSecretName }}
+      - name: vault-ca-bundle
+        emptyDir: {}
+{{- end }}
+{{- if and (ne $vaultCaSecretName "") .Values.NiFiSync.s3Sync.enabled }}
+      - name: merged-ca-bundle
+        emptyDir: {}
+{{- end }}
 {{- if or .Values.NiFiSync.s3Sync.enabled .Values.NiFiSync.UserPolicySync.enabled}}
       - name: nifisync-scripts
         configMap:
@@ -158,7 +182,7 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
           secretName: {{ template "apache-nifi.fullname" $ }}-sync-secret-modifier-token
 {{- end }}
 {{- if eq (include "nifi.secretSyncEnabled" .) "true" }}
-    {{- range .Values.NiFiSync.syncPaths }}
+    {{- range (include "nifi.syncPaths" . | fromJsonArray) }}
     {{- if and (default true .enabled) (ne .pathType "fs") (or (ne .pathType "tls-secret") $.Values.ingress.enabled) }}
       - name: {{ include "apache-nifi.fullname" $ }}-{{ .pathName }}
         secret:

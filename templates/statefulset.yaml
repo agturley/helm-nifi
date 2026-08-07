@@ -62,35 +62,26 @@ spec:
 {{ toYaml .Values.sts.hostAliases | indent 8 }}
 {{- end }}
       serviceAccountName: {{ include "apache-nifi.serviceAccountName" . }}
-      {{- if eq .Values.sts.AntiAffinity "hard" }}
+      {{- $builtinAff := dict -}}
+      {{- if eq .Values.sts.AntiAffinity "hard" -}}
+        {{- $matchExpr := dict "key" "app" "operator" "In" "values" (list (include "apache-nifi.name" .)) -}}
+        {{- $lsel := dict "matchExpressions" (list $matchExpr) -}}
+        {{- $term := dict "labelSelector" $lsel "topologyKey" "kubernetes.io/hostname" -}}
+        {{- $antiAff := dict "requiredDuringSchedulingIgnoredDuringExecution" (list $term) -}}
+        {{- $builtinAff = dict "podAntiAffinity" $antiAff -}}
+      {{- else if eq .Values.sts.AntiAffinity "soft" -}}
+        {{- $matchExpr := dict "key" "app" "operator" "In" "values" (list (include "apache-nifi.name" .)) -}}
+        {{- $lsel := dict "matchExpressions" (list $matchExpr) -}}
+        {{- $patTerm := dict "labelSelector" $lsel "topologyKey" "kubernetes.io/hostname" -}}
+        {{- $preferred := dict "weight" 1 "podAffinityTerm" $patTerm -}}
+        {{- $antiAff := dict "preferredDuringSchedulingIgnoredDuringExecution" (list $preferred) -}}
+        {{- $builtinAff = dict "podAntiAffinity" $antiAff -}}
+      {{- end -}}
+      {{- $finalAff := mergeOverwrite $builtinAff (.Values.affinity | default dict) -}}
+      {{- if $finalAff }}
       affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchExpressions:
-                  - key: "app"
-                    operator: In
-                    values:
-                    - {{ include "apache-nifi.name" . | quote }}
-              topologyKey: "kubernetes.io/hostname"
-      {{- else if eq .Values.sts.AntiAffinity "soft" }}
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-             - weight: 1
-               podAffinityTerm:
-                 labelSelector:
-                    matchExpressions:
-                      - key: "app"
-                        operator: In
-                        values:
-                         - {{ include "apache-nifi.name" . | quote }}
-                 topologyKey: "kubernetes.io/hostname"
+{{ toYaml $finalAff | indent 8 }}
       {{- end }}
-{{- if and .Values.affinity (and (ne .Values.sts.AntiAffinity "hard") (ne .Values.sts.AntiAffinity "soft")) }}
-      affinity:
-{{ toYaml .Values.affinity | indent 8 }}
-{{- end }}
 {{- if .Values.terminationGracePeriodSeconds }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
 {{- end }}
@@ -113,8 +104,8 @@ spec:
       initContainers:
 {{- if and .Values.properties.isNode (ne .Values.zookeeperInit.enabled false) (not .Values.kubernetesClusterState.enabled) }}
       - name: zookeeper
-        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
-        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        imagePullPolicy: {{ .Values.images.sidecar.pullPolicy | default "Always" | quote }}
+        image: "{{ .Values.images.sidecar.repository }}:{{ .Values.images.sidecar.tag }}"
         resources:
 {{- toYaml .Values.zookeeperResources | nindent 10 }}
         command:
@@ -129,14 +120,22 @@ spec:
 {{- end }}
 {{- if .Values.NiFiSync.UserPolicySync.enabled }} 
       - name: nifi-policysync
-        imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.images.nifi.pullPolicy | quote }}
+        image: "{{ .Values.images.nifi.repository }}:{{ .Values.images.nifi.tag }}"
         command: ["python3", "/opt/nifi/nifi-sync/scripts/nifi-policysync.py"]
         env:
           - name: RESET_AUTH_FILES
             value: {{ .Values.NiFiSync.UserPolicySync.resetAuthFiles | default false | quote }}
+          {{- if (ternary (.Values.auth.ldap.admin | default "") (.Values.auth.admin | default "") .Values.auth.ldap.enabled) }}
           - name: INITIAL_ADMIN_IDENTITY
-            value: {{ if .Values.auth.ldap.enabled }}{{ .Values.auth.ldap.admin | default "" | quote }}{{ else }}{{ .Values.auth.admin | default "" | quote }}{{ end }}
+            value: {{ ternary (.Values.auth.ldap.admin | default "") (.Values.auth.admin | default "") .Values.auth.ldap.enabled | quote }}
+          {{- end }}
+          - name: SECRETS_MODE
+            value: {{ include "nifi.effectiveSecretsMode" . | quote }}
+          - name: SECRETS_PATH
+            value: {{ .Values.properties.secretsFilePath | quote }}
+          - name: SECRETS_FILE
+            value: {{ .Values.properties.secretsFile | default "credentials.env" | quote }}
         resources:
 {{ toYaml .Values.syncresources | indent 10 }}        
         volumeMounts:
@@ -156,14 +155,20 @@ spec:
             {{- else }}
             name: "auth-conf"
             {{- end }}
+          {{- $vaultOwnsSecretsPath := and .Values.VaultNiFiSecrets.enabled (eq (default "" .Values.VaultNiFiSecrets.secretProvider) "vaultSidecar") }}
+          {{- if and .Values.properties.secretsName (ne (include "nifi.effectiveSecretsMode" .) "none") (not $vaultOwnsSecretsPath) }}
+          - name: k8s-secrets
+            mountPath: {{ .Values.properties.secretsFilePath }}
+            readOnly: true
+          {{- end }}
         
 {{- end }}
 {{- $vals := .Values.VaultNiFiSecrets }}
 
 {{- if .Values.persistence.enabled }}
       - name: create-custom-dir
-        imagePullPolicy: {{ .Values.sidecar.imagePullPolicy | default "Always" | quote }}
-        image: "{{ .Values.sidecar.image }}:{{ .Values.sidecar.tag }}"
+        imagePullPolicy: {{ .Values.images.sidecar.pullPolicy | default "Always" | quote }}
+        image: "{{ .Values.images.sidecar.repository }}:{{ .Values.images.sidecar.tag }}"
         resources:
 {{ toYaml .Values.logresources | indent 10 }}
         command:
@@ -185,9 +190,75 @@ spec:
       - name: {{ $key }}
 {{ toYaml $value | indent 8 }}
 {{- end }}
+{{- $vaultVals := .Values.VaultNiFiSecrets -}}
+{{- $vaultCaSecrets := .Values.caSecrets -}}
+{{- $vaultCaSecretName := default "" $vaultVals.vaultSidecar.caSecretName -}}
+{{- if and (eq $vaultCaSecretName "") (gt (len $vaultCaSecrets) 0) -}}
+{{- $vaultCaSecretName = index $vaultCaSecrets 0 -}}
+{{- end -}}
+{{- if ne $vaultCaSecretName "" }}
+      - name: prepare-ca-bundle
+        image: {{ .Values.images.utility.repository }}:{{ .Values.images.utility.tag }}
+        imagePullPolicy: {{ .Values.images.utility.pullPolicy | quote }}
+        command: ["/bin/sh", "-ec"]
+        args:
+          - |
+            set -e
+            out=/work/ca-bundle.pem
+            : > "$out"
+            {{- if .Values.NiFiSync.s3Sync.enabled }}
+            merged=/merged-certs/ca-bundle.crt
+            : > "$merged"
+            # Try RHEL/UBI then Debian/Alpine system CA paths
+            for system_ca in /etc/pki/tls/certs/ca-bundle.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/certs/ca-certificates.crt; do
+              if [ -f "$system_ca" ]; then
+                cat "$system_ca" >> "$merged"
+                printf '\n' >> "$merged"
+                echo "Added system CA bundle from $system_ca"
+                break
+              fi
+            done
+            {{- end }}
+            found=0
+            for file in /input/*; do
+              [ -f "$file" ] || continue
+              case "$file" in
+                *.crt|*.cer|*.pem)
+                  cat "$file" >> "$out"
+                  printf '\n' >> "$out"
+                  {{- if .Values.NiFiSync.s3Sync.enabled }}
+                  cat "$file" >> "$merged"
+                  printf '\n' >> "$merged"
+                  {{- end }}
+                  found=1
+                  ;;
+              esac
+            done
+            if [ "$found" -eq 0 ]; then
+              echo "No CA files found in /input" >&2
+              exit 1
+            fi
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        volumeMounts:
+          - name: ca-secret-files
+            mountPath: /input
+            readOnly: true
+          - name: vault-ca-bundle
+            mountPath: /work
+          {{- if .Values.NiFiSync.s3Sync.enabled }}
+          - name: merged-ca-bundle
+            mountPath: /merged-certs
+          {{- end }}
+{{- end }}
       {{- $pullSecrets := list -}}
-      {{- if .Values.image.pullSecret }}{{- $pullSecrets = append $pullSecrets .Values.image.pullSecret }}{{- end }}
-      {{- if and .Values.awsSecretsSync.enabled .Values.awsSecretsSync.image.pullSecret }}{{- $pullSecrets = append $pullSecrets .Values.awsSecretsSync.image.pullSecret }}{{- end }}
+      {{- if .Values.images.nifi.pullSecret }}{{- $pullSecrets = append $pullSecrets .Values.images.nifi.pullSecret }}{{- end }}
+      {{- if .Values.images.utility.pullSecret }}{{- $pullSecrets = append $pullSecrets .Values.images.utility.pullSecret }}{{- end }}
       {{- if $pullSecrets }}
       imagePullSecrets:
         {{- range $pullSecrets }}
