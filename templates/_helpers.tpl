@@ -68,6 +68,24 @@ Call with a dict: (dict "ctx" $ "node" <index>).
 {{- end -}}
 
 {{/*
+Number of node identity slots (Node Identity / Initial User Identity entries in
+authorizers.xml) to pre-provision. Defaults to replicaCount. Set
+maxReplicaCount higher than replicaCount to reserve extra slots so that
+changing replicaCount later, up or down within that ceiling, does not change
+the rendered text of the shared StatefulSet pod template - which would
+otherwise force Kubernetes to roll every existing node, not just the one being
+added or removed. Call with the root context ($).
+*/}}
+{{- define "nifi.identityPoolSize" -}}
+{{- $current := int .Values.replicaCount -}}
+{{- $pool := int (.Values.maxReplicaCount | default .Values.replicaCount) -}}
+{{- if lt $pool $current -}}
+{{- fail (printf "maxReplicaCount (%d) must be >= replicaCount (%d)" $pool $current) -}}
+{{- end -}}
+{{- $pool -}}
+{{- end -}}
+
+{{/*
 issuerRef body for cert-manager Certificate resources.
 When certManager.issuerRef.name is set, reference that existing
 Issuer/ClusterIssuer; otherwise reference the chart-managed CA Issuer.

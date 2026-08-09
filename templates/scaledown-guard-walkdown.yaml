@@ -1,0 +1,184 @@
+---
+{{- if and .Values.scaleDownGuard.enabled .Values.scaleDownGuard.walkdown.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: [{{ include "apache-nifi.fullname" . | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.scaleDownGuard.walkdown.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+{{- include "nifi.commonLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
+      containers:
+        - name: walkdown
+          image: "{{ .Values.scaleDownGuard.walkdown.image.repository }}:{{ .Values.scaleDownGuard.walkdown.image.tag }}"
+          imagePullPolicy: {{ .Values.scaleDownGuard.walkdown.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              STS_NAME={{ include "apache-nifi.fullname" . | quote }}
+              NAMESPACE={{ .Release.Namespace | quote }}
+              TARGET={{ .Values.replicaCount }}
+              STEP={{ .Values.scaleDownGuard.maxStepDown }}
+              STEP_TIMEOUT={{ .Values.scaleDownGuard.walkdown.stepTimeoutSeconds }}
+              SETTLE_PAUSE={{ .Values.scaleDownGuard.walkdown.settlePauseSeconds }}
+
+              current=$(kubectl get statefulset "$STS_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")
+
+              if [[ -z "$current" ]]; then
+                  echo "StatefulSet $STS_NAME not found in $NAMESPACE; nothing to walk down (first install)."
+                  exit 0
+              fi
+
+              echo "current replicas: $current, target: $TARGET, step: $STEP"
+
+              if [[ "$TARGET" -ge "$current" ]]; then
+                  echo "Not a scale-down (or no-op); nothing to walk down here."
+                  exit 0
+              fi
+
+              stop_at=$((TARGET + STEP))
+              if [[ "$stop_at" -gt "$current" ]]; then
+                  stop_at=$current
+              fi
+
+              wait_for_stable() {
+                  local want=$1
+                  local elapsed=0
+                  while [[ "$elapsed" -lt "$STEP_TIMEOUT" ]]; do
+                      local status_replicas ready_replicas
+                      status_replicas=$(kubectl get statefulset "$STS_NAME" -n "$NAMESPACE" -o jsonpath='{.status.replicas}' 2>/dev/null || echo "")
+                      ready_replicas=$(kubectl get statefulset "$STS_NAME" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+                      if [[ "$status_replicas" == "$want" && "$ready_replicas" == "$want" ]]; then
+                          echo "  reached $want replicas, all ready (${elapsed}s)"
+                          return 0
+                      fi
+                      sleep 5
+                      elapsed=$((elapsed + 5))
+                      echo "  waiting for $want replicas (status=$status_replicas ready=$ready_replicas, ${elapsed}s)"
+                  done
+                  echo "ERROR: timed out after ${STEP_TIMEOUT}s waiting for $want replicas to stabilize"
+                  return 1
+              }
+
+              # The preStop hook skips delete-node (and exits non-zero, which the
+              # kubelet reports as this event) when a node still has FlowFiles
+              # queued that offload couldn't relocate. That node is deliberately
+              # left registered as a visible DISCONNECTED/OFFLOADED entry rather
+              # than being silently removed - so if this fires, stop here instead
+              # of tearing down another node on top of an unresolved one.
+              #
+              # Only events with lastTimestamp after this step's own start time
+              # count - Kubernetes keeps events around for up to an hour, so an
+              # unfiltered check would keep tripping on a real failure from a
+              # much earlier, unrelated attempt on the same pod name forever.
+              check_failed_prestop() {
+                  local from=$1
+                  local to=$2
+                  local since=$3
+                  local ordinal podname timestamps ts
+                  for ordinal in $(seq "$from" "$to"); do
+                      podname="${STS_NAME}-${ordinal}"
+                      timestamps=$(kubectl get events -n "$NAMESPACE" \
+                          --field-selector "involvedObject.name=${podname},reason=FailedPreStopHook" \
+                          -o jsonpath='{range .items[*]}{.lastTimestamp}{"\n"}{end}' 2>/dev/null || echo "")
+                      for ts in $timestamps; do
+                          if [[ "$ts" > "$since" ]]; then
+                              echo "ERROR: preStop safety check failed for pod ${podname} at ${ts} (after this step started at ${since})."
+                              echo "ERROR: that node likely still has un-relocatable queued FlowFiles and was intentionally NOT removed from the NiFi cluster registry."
+                              echo "ERROR: check 'nifi get-nodes' and investigate before scaling down further."
+                              return 1
+                          fi
+                      done
+                  done
+                  return 0
+              }
+
+              next=$current
+              while [[ "$next" -gt "$stop_at" ]]; do
+                  prev=$next
+                  next=$((next - STEP))
+                  if [[ "$next" -lt "$stop_at" ]]; then
+                      next=$stop_at
+                  fi
+                  step_start_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                  echo "scaling $STS_NAME down to $next"
+                  kubectl patch statefulset "$STS_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$next}}"
+                  wait_for_stable "$next"
+                  check_failed_prestop "$next" "$((prev - 1))" "$step_start_time"
+                  echo "settling ${SETTLE_PAUSE}s before next step"
+                  sleep "$SETTLE_PAUSE"
+              done
+
+              echo "walkdown reached $stop_at replicas; remaining decrement to $TARGET (if any) will be applied by this upgrade"
+{{- end }}

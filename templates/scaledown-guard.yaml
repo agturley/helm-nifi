@@ -1,0 +1,55 @@
+---
+{{- if .Values.scaleDownGuard.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-guard
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["apps"]
+      apiVersions: ["v1"]
+      operations:  ["UPDATE"]
+      # Both are needed: a full object apply (helm upgrade, kubectl apply/edit)
+      # goes through "statefulsets"; `kubectl scale` and the HPA go through
+      # the "statefulsets/scale" subresource instead, which is a distinct
+      # resource for admission-matching purposes even though the request
+      # targets the same object.
+      resources:   ["statefulsets", "statefulsets/scale"]
+  # Scoped by name/namespace rather than labels: the "statefulsets/scale"
+  # subresource is an autoscaling/v1.Scale object that carries metadata.name
+  # and metadata.namespace but no metadata.labels, so an objectSelector-based
+  # binding silently never matches scale-subresource requests.
+  matchConditions:
+  - name: is-target-statefulset
+    expression: >-
+      object.metadata.name == {{ include "apache-nifi.fullname" . | quote }}
+      && object.metadata.namespace == {{ .Release.Namespace | quote }}
+  validations:
+  - expression: "object.spec.replicas >= oldObject.spec.replicas - {{ .Values.scaleDownGuard.maxStepDown }}"
+    messageExpression: >-
+      "Scaling down more than {{ .Values.scaleDownGuard.maxStepDown }} replica(s) at a time is blocked for this StatefulSet ("
+      + string(oldObject.spec.replicas) + " -> " + string(object.spec.replicas)
+      + " requested); reduce replicaCount incrementally instead."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-guard-binding
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+spec:
+  policyName: {{ include "apache-nifi.fullname" . }}-scaledown-guard
+  validationActions: ["Deny"]
+{{- end }}

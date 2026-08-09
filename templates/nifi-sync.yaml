@@ -16,7 +16,8 @@ data:
     Features:
       1. ENABLE_MANAGED_GROUPS: skip or include built-in managed groups
       2. Custom monitoring user with read-only access (env MONITORING_USER)
-      3. Node users generated per REPLICA_COUNT
+      3. Node users generated per REPLICA_COUNT, or a single shared identity when
+         shared node identity mapping is enabled (SHARED_NODE_IDENTITY)
       4. External LDAP groups granted roles via the `external_group_roles` mapping without creating entries in users.xml
 
     Tracks dropped external groups in `external_groups.json` and removes their policies.
@@ -438,11 +439,14 @@ data:
                     if grp_elem is not None and not grp_elem.find(f"./user[@identifier='{uid}']"):
                         ET.SubElement(grp_elem, "user", {"identifier": uid})
 
-        # Node users
-        node_uids = [ensure_user(users_root, NODE_USER_TEMPLATE.format(i=i), user_ids) for i in range(REPLICA_COUNT)]
-        for idx, uid in enumerate(node_uids):
-            uname = NODE_USER_TEMPLATE.format(i=idx)
-            current_users.add(uname)
+        # Node users (skipped when shared node identity mapping consolidates all
+        # nodes into the single SHARED_NODE_IDENTITY handled below)
+        node_uids = []
+        if not SHARED_NODE_IDENTITY:
+            node_uids = [ensure_user(users_root, NODE_USER_TEMPLATE.format(i=i), user_ids) for i in range(REPLICA_COUNT)]
+            for idx, uid in enumerate(node_uids):
+                uname = NODE_USER_TEMPLATE.format(i=idx)
+                current_users.add(uname)
 
         # Shared mapped node identity (when shared-node identity mapping is enabled)
         shared_node_uid = None
@@ -494,7 +498,8 @@ data:
                 auth_tree = ET.ElementTree(auth_root)
             policies_elem = auth_root.find("policies") or ET.SubElement(auth_root, "policies")
 
-            # Assign per-node-user permissions
+            # Assign per-node-user permissions (node_uids is empty when
+            # SHARED_NODE_IDENTITY is set, so this loop is a no-op there)
             node_permissions = [
                 ("R", "/data/process-groups/ROOT_PG"),
                 ("W", "/data/process-groups/ROOT_PG"),

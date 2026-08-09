@@ -149,6 +149,11 @@ Volume definitions and VolumeClaimTemplates for the NiFi StatefulSet.
       {{- end }}
 {{- /* if .Values.certManager.enabled */}}
 {{- end }}
+{{- if .Values.scaleDownGuard.enabled }}
+      - name: sts-reader-token
+        secret:
+          secretName: {{ template "apache-nifi.fullname" $ }}-scaledown-sts-reader-token
+{{- end }}
 {{- $vaultVals := .Values.VaultNiFiSecrets -}}
 {{- $vaultCaSecrets := .Values.caSecrets -}}
 {{- $vaultCaSecretName := default "" $vaultVals.vaultSidecar.caSecretName -}}

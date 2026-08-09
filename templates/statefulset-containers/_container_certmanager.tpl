@@ -263,7 +263,13 @@
                           -storepass "${NIFI_TLS_KEYSTORE_PASSWORD}"
 
             echo Starting to sleep for {{ .Values.certManager.refreshSeconds }} seconds at $(date)
-            sleep {{ .Values.certManager.refreshSeconds }}
+            # Backgrounded + waited-on rather than a plain foreground sleep:
+            # bash only lets a trap interrupt the `wait` builtin early on a
+            # trapped signal - a plain foreground `sleep N` defers the trap
+            # until sleep finishes on its own, so on SIGTERM this container
+            # would otherwise sit for up to refreshSeconds before exiting.
+            sleep {{ .Values.certManager.refreshSeconds }} &
+            wait $!
           done
         volumeMounts:
     {{- if eq (include "nifi.secretSyncEnabled" $) "true" }}

@@ -17,6 +17,7 @@ metadata:
 spec:
   type: {{ .Values.headless.type }}
   clusterIP: None
+  publishNotReadyAddresses: true
   ports:
   - port: {{ .Values.properties.httpsPort }}
     name: https

@@ -45,6 +45,13 @@
         args:
         - |
           #!/bin/sh
+          # Without a trap, this script (running as the container's PID 1)
+          # is immune to SIGTERM - Linux exempts PID 1 from default signal
+          # dispositions unless it installs its own handler - so it would
+          # otherwise ignore scale-down/rollout termination entirely and
+          # force Kubernetes to wait out the full terminationGracePeriodSeconds
+          # before SIGKILLing it.
+          trap "exit 0" TERM
           # --- Prefix every stdout/stderr line with an ISO-8601 UTC timestamp ---
           # Routes all output (including raw stderr from sub-tools and python)
           # through one timestamper so every log line is machine-parseable.

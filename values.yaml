@@ -2,6 +2,16 @@
 # Number of nifi nodes
 replicaCount: 1
 
+# Ceiling for pre-provisioned node identity slots (Node Identity / Initial User
+# Identity entries in authorizers.xml and per-node certificate CNs). Defaults to
+# replicaCount when unset. Set this higher than replicaCount to reserve extra
+# slots so that changing replicaCount later, up or down within that ceiling,
+# does not change the shared StatefulSet pod template text - which would
+# otherwise force Kubernetes to roll every existing node, not just the one
+# being added or removed. Must be >= replicaCount. Raising maxReplicaCount
+# itself still triggers a one-time rolling restart of all nodes.
+# maxReplicaCount: 5
+
 ## Set default image, imageTag, and imagePullPolicy.
 ## ref: https://hub.docker.com/r/apache/nifi/
 ##
@@ -71,6 +81,11 @@ images:
 
 sts:
   # Parallel podManagementPolicy for faster bootstrap and teardown. Default is OrderedReady.
+  # With Parallel, reducing replicaCount by more than 1 terminates that many
+  # pods simultaneously - each one's preStop drain hook then races the others
+  # to find a still-connected peer to route through. See scaleDownGuard below
+  # for an admission-time guard against this, if you'd rather keep Parallel
+  # for fast scale-up/bootstrap than switch this to OrderedReady outright.
   podManagementPolicy: Parallel
   AntiAffinity: soft
   useHostNetwork: null
@@ -162,6 +177,17 @@ properties:
   externalSecure: false
   isNode: false
   httpsPort: 8443
+  # After offload-node reaches OFFLOADED, relocating content queued in
+  # non-load-balanced connections is asynchronous, and how long it takes
+  # scales with how much is actually queued - not a fixed duration. The
+  # preStop hook polls the node's own local queue count (not the
+  # cluster-aggregated view, which can lag) and keeps waiting as long as that
+  # count is still going down. It only gives up early if the count stops
+  # improving for drainQueueStallLimit consecutive polls (10s apart), or if
+  # this absolute ceiling is hit first. Raising either eats into the same
+  # budget as terminationGracePeriodSeconds; increase that together with these.
+  drainQueueTimeoutSeconds: 180
+  drainQueueStallLimit: 6
   webProxyHost: # <clusterIP>:<NodePort> (If Nifi service is NodePort or LoadBalancer)
   clusterPort: 6007
   clusterProtocolIsSecure: true
@@ -988,6 +1014,59 @@ kubernetesClusterState:
   # Optional prefix applied to Lease resource names — useful when multiple NiFi
   # clusters share the same namespace.
   leasePrefix: ""
+
+# ------------------------------------------------------------------------------
+# Admission-time guard against unsafe scale-downs, and prerequisite for the
+# offload-vs-restart distinction below. See doc/SCALEDOWN.md for the full
+# picture (how draining works, what gets created under each flag, debugging).
+#
+# Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy) and permission for
+# whatever applies this chart (Helm's service account, ArgoCD, etc.) to manage
+# the cluster-scoped ValidatingAdmissionPolicy/ValidatingAdmissionPolicyBinding
+# resources. When enabled, decreasing replicaCount by more than maxStepDown in
+# a single StatefulSet update is rejected by the API server - scale-up is
+# unaffected, so sts.podManagementPolicy can stay Parallel for fast bootstrap
+# while scale-down is still forced to happen one step at a time.
+#
+# Also creates a separate, narrowly-scoped "sts-reader" identity (read-only,
+# this one named StatefulSet - never granted to the pods' own serviceAccount)
+# that every node's preStop hook uses to tell a real scale-down apart from a
+# routine restart/rolling-update, so the disconnect/offload/delete-node
+# sequence only runs when a node is actually being permanently removed. With
+# this disabled (the default), that sequence runs on every pod removal,
+# restart or not.
+# ------------------------------------------------------------------------------
+scaleDownGuard:
+  enabled: false
+  maxStepDown: 1
+  # Optional pre-upgrade Helm hook Job that walks a large replicaCount
+  # decrease down to maxStepDown-sized steps automatically, so a single
+  # `helm upgrade` with a lower replicaCount still works in one command
+  # instead of failing against the guard above. Runs before Helm applies the
+  # StatefulSet update; stops one step above the final target and lets that
+  # last decrement happen as part of the normal upgrade (which the guard
+  # already allows, since it's a single step). Requires an image with
+  # kubectl on the PATH, reachable from this cluster.
+  walkdown:
+    enabled: false
+    image:
+      repository: bitnami/kubectl
+      tag: "latest"
+      pullPolicy: IfNotPresent
+    # Per-step wait for the StatefulSet to report the new replica count with
+    # all remaining pods Ready before proceeding to the next step. A pod being
+    # removed can legitimately take up to terminationGracePeriodSeconds to
+    # fully disappear (preStop's drain-wait plus nifi.sh stop), so this MUST
+    # be set higher than terminationGracePeriodSeconds - with margin, since
+    # the wait also covers the new pod at the next ordinal starting back up -
+    # or the walkdown Job can time out and fail the upgrade even when the
+    # underlying drain/removal actually completed successfully.
+    stepTimeoutSeconds: 450
+    # Extra pause after a step looks stable, before starting the next one -
+    # gives the preStop-driven cluster cleanup a moment to fully settle.
+    settlePauseSeconds: 15
+    # Overall Job deadline; must be large enough for (steps * (stepTimeout + settlePause)).
+    activeDeadlineSeconds: 1800
 
 # ------------------------------------------------------------------------------
 # Zookeeper:

@@ -1,0 +1,74 @@
+---
+{{- if .Values.scaleDownGuard.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader-token
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+  annotations:
+    kubernetes.io/service-account.name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+rules:
+  # Read-only, and scoped to this one named StatefulSet - used by every
+  # node's preStop hook to tell a real scale-down (my ordinal is being
+  # permanently removed) apart from a routine restart/rolling-update
+  # (I'll be recreated), so offload only runs when it's actually needed.
+  # This identity is deliberately separate from the pods' own
+  # serviceAccountName so that the main pod identity, used unconditionally
+  # by every deployment, never carries any Kubernetes API permissions.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: [{{ include "apache-nifi.fullname" . | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- include "nifi.commonLabels" . | nindent 4 }}
+    app: {{ include "apache-nifi.name" . | quote }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}"
+    release: {{ .Release.Name | quote }}
+    heritage: {{ .Release.Service | quote }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "apache-nifi.fullname" . }}-scaledown-sts-reader
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
