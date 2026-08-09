@@ -1,5 +1,20 @@
 ---
 {{- if and .Values.scaleDownGuard.enabled .Values.scaleDownGuard.walkdown.enabled }}
+{{- $wd := .Values.scaleDownGuard.walkdown }}
+{{- $step := int .Values.scaleDownGuard.maxStepDown }}
+{{- if lt $step 1 }}{{ fail (printf "scaleDownGuard.maxStepDown must be >= 1 (got %d)" $step) }}{{ end }}
+{{/*
+Upper bound on the number of walkdown steps this Job could need. The Job cannot
+know the cluster's current replica count at render time, but it can never be
+above the identity pool ceiling, so (pool - target) / maxStepDown - rounded up -
+bounds it. Deriving activeDeadlineSeconds from that keeps the Job from being
+killed partway through a legitimate walkdown, which would abort the upgrade with
+the StatefulSet stranded at an intermediate replica count. An explicit
+walkdown.activeDeadlineSeconds still wins if one is set.
+*/}}
+{{- $steps := max 1 (div (add (sub (int (include "nifi.identityPoolSize" $)) (int .Values.replicaCount)) (sub $step 1)) $step) }}
+{{- $perStep := add (int $wd.stepTimeoutSeconds) (int $wd.settlePauseSeconds) }}
+{{- $deadline := $wd.activeDeadlineSeconds | default (add (mul (int $steps) $perStep) 60) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -69,7 +84,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: {{ .Values.scaleDownGuard.walkdown.activeDeadlineSeconds }}
+  activeDeadlineSeconds: {{ $deadline }}
   template:
     metadata:
       labels:
@@ -79,47 +94,46 @@ spec:
       serviceAccountName: {{ include "apache-nifi.fullname" . }}-scaledown-walkdown
       containers:
         - name: walkdown
-          image: "{{ .Values.scaleDownGuard.walkdown.image.repository }}:{{ .Values.scaleDownGuard.walkdown.image.tag }}"
-          imagePullPolicy: {{ .Values.scaleDownGuard.walkdown.image.pullPolicy }}
-          command: ["/bin/bash", "-c"]
+          image: "{{ $wd.image.repository }}:{{ $wd.image.tag }}"
+          imagePullPolicy: {{ $wd.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
           args:
             - |
-              set -euo pipefail
+              set -eu
 
               STS_NAME={{ include "apache-nifi.fullname" . | quote }}
               NAMESPACE={{ .Release.Namespace | quote }}
               TARGET={{ .Values.replicaCount }}
-              STEP={{ .Values.scaleDownGuard.maxStepDown }}
-              STEP_TIMEOUT={{ .Values.scaleDownGuard.walkdown.stepTimeoutSeconds }}
-              SETTLE_PAUSE={{ .Values.scaleDownGuard.walkdown.settlePauseSeconds }}
+              STEP={{ $step }}
+              STEP_TIMEOUT={{ $wd.stepTimeoutSeconds }}
+              SETTLE_PAUSE={{ $wd.settlePauseSeconds }}
 
               current=$(kubectl get statefulset "$STS_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")
 
-              if [[ -z "$current" ]]; then
+              if [ -z "$current" ]; then
                   echo "StatefulSet $STS_NAME not found in $NAMESPACE; nothing to walk down (first install)."
                   exit 0
               fi
 
               echo "current replicas: $current, target: $TARGET, step: $STEP"
 
-              if [[ "$TARGET" -ge "$current" ]]; then
+              if [ "$TARGET" -ge "$current" ]; then
                   echo "Not a scale-down (or no-op); nothing to walk down here."
                   exit 0
               fi
 
               stop_at=$((TARGET + STEP))
-              if [[ "$stop_at" -gt "$current" ]]; then
+              if [ "$stop_at" -gt "$current" ]; then
                   stop_at=$current
               fi
 
               wait_for_stable() {
-                  local want=$1
-                  local elapsed=0
-                  while [[ "$elapsed" -lt "$STEP_TIMEOUT" ]]; do
-                      local status_replicas ready_replicas
+                  want=$1
+                  elapsed=0
+                  while [ "$elapsed" -lt "$STEP_TIMEOUT" ]; do
                       status_replicas=$(kubectl get statefulset "$STS_NAME" -n "$NAMESPACE" -o jsonpath='{.status.replicas}' 2>/dev/null || echo "")
                       ready_replicas=$(kubectl get statefulset "$STS_NAME" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-                      if [[ "$status_replicas" == "$want" && "$ready_replicas" == "$want" ]]; then
+                      if [ "$status_replicas" = "$want" ] && [ "$ready_replicas" = "$want" ]; then
                           echo "  reached $want replicas, all ready (${elapsed}s)"
                           return 0
                       fi
@@ -142,18 +156,25 @@ spec:
               # count - Kubernetes keeps events around for up to an hour, so an
               # unfiltered check would keep tripping on a real failure from a
               # much earlier, unrelated attempt on the same pod name forever.
+              # RFC3339 UTC timestamps sort lexicographically, so "is $ts strictly
+              # after $since" is: the two differ, and $since sorts first.
+              is_after() {
+                  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort | head -1)" = "$2" ]
+              }
+
               check_failed_prestop() {
-                  local from=$1
-                  local to=$2
-                  local since=$3
-                  local ordinal podname timestamps ts
-                  for ordinal in $(seq "$from" "$to"); do
+                  from=$1
+                  to=$2
+                  since=$3
+                  ordinal=$from
+                  while [ "$ordinal" -le "$to" ]; do
                       podname="${STS_NAME}-${ordinal}"
+                      ordinal=$((ordinal + 1))
                       timestamps=$(kubectl get events -n "$NAMESPACE" \
                           --field-selector "involvedObject.name=${podname},reason=FailedPreStopHook" \
                           -o jsonpath='{range .items[*]}{.lastTimestamp}{"\n"}{end}' 2>/dev/null || echo "")
                       for ts in $timestamps; do
-                          if [[ "$ts" > "$since" ]]; then
+                          if is_after "$ts" "$since"; then
                               echo "ERROR: preStop safety check failed for pod ${podname} at ${ts} (after this step started at ${since})."
                               echo "ERROR: that node likely still has un-relocatable queued FlowFiles and was intentionally NOT removed from the NiFi cluster registry."
                               echo "ERROR: check 'nifi get-nodes' and investigate before scaling down further."
@@ -165,10 +186,10 @@ spec:
               }
 
               next=$current
-              while [[ "$next" -gt "$stop_at" ]]; do
+              while [ "$next" -gt "$stop_at" ]; do
                   prev=$next
                   next=$((next - STEP))
-                  if [[ "$next" -lt "$stop_at" ]]; then
+                  if [ "$next" -lt "$stop_at" ]; then
                       next=$stop_at
                   fi
                   step_start_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)

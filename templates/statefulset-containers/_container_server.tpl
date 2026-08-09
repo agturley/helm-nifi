@@ -337,9 +337,9 @@
           # a way preStop's exec context does not.
           executeTrap() {
              echo Received trapped signal, beginning shutdown...;
-             printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "trap: SIGTERM received, calling nifi.sh stop (pid $$)" >> /opt/nifi/data/prestop-timeline.log 2>/dev/null || true;
+             printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "trap: SIGTERM received, calling nifi.sh stop (pid $$)" 2>/dev/null >> /opt/nifi/data/prestop-timeline.log || true;
              ./bin/nifi.sh stop;
-             printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "trap: nifi.sh stop returned, exiting 0 (pid $$)" >> /opt/nifi/data/prestop-timeline.log 2>/dev/null || true;
+             printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "trap: nifi.sh stop returned, exiting 0 (pid $$)" 2>/dev/null >> /opt/nifi/data/prestop-timeline.log || true;
              exit 0;
           }
 
@@ -396,14 +396,16 @@
 {{- end }}
 
 
-{{- if or .Values.postStart .Values.properties.isNode }}
+{{- $drainEnabled := and .Values.properties.isNode .Values.scaleDownGuard.enabled }}
+{{- if $drainEnabled }}{{ include "nifi.validateDrainBudget" $ }}{{ end }}
+{{- if or .Values.postStart $drainEnabled }}
         lifecycle:
 {{- if .Values.postStart }}
           postStart:
             exec:
               command: ["/bin/sh", "-c", {{ .Values.postStart | quote }}]
 {{- end }}
-{{- if .Values.properties.isNode }}
+{{- if $drainEnabled }}
           preStop:
             exec:
               command:
@@ -411,11 +413,15 @@
                 - -c
                 - |
                   set -o pipefail
+                  # The properties file below is assembled here and carries the
+                  # keystore and truststore passwords, so keep it unreadable to
+                  # anything but this process's own user.
+                  umask 077
                   FQDN=$(hostname -f)
                   cd "${NIFI_HOME}" || exit 0
 
                   prop() {
-                    egrep "^${1}=" "${NIFI_HOME}/conf/nifi.properties" | cut -d'=' -f2
+                    grep -E "^${1}=" "${NIFI_HOME}/conf/nifi.properties" | cut -d'=' -f2
                   }
 
                   # preStop's own stdout is NOT captured by `kubectl logs` (it's
@@ -426,10 +432,17 @@
                   # to the persistent data volume means the timeline survives
                   # even after this pod is gone.
                   LOGFILE=/opt/nifi/data/prestop-timeline.log
+                  # 2>/dev/null precedes the append so that it is already in
+                  # effect if the append itself fails - redirections are applied
+                  # left to right, and a failing `>>` reports on whatever stderr
+                  # is at that moment. With the other order, a missing or
+                  # read-only data volume makes every single log line emit a
+                  # shell error, which is exactly the noise this log exists to
+                  # cut through.
                   log() {
                     local msg="$*"
                     echo "${msg}"
-                    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "${msg}" >> "${LOGFILE}" 2>/dev/null || true
+                    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "${msg}" 2>/dev/null >> "${LOGFILE}" || true
                   }
                   log "preStop: hook invoked (pid $$)"
 
@@ -440,28 +453,43 @@
                   # StatefulSet's current spec.replicas, using a narrowly-scoped
                   # identity (get-only, this one named StatefulSet) that is
                   # completely separate from this pod's own serviceAccountName -
-                  # see templates/scaledown-guard-sts-reader.yaml. That identity
-                  # only exists when scaleDownGuard.enabled=true; when it's
-                  # absent (the default), the safe default is to skip offload
-                  # entirely rather than doing unnecessary drain work - and
-                  # possibly failing - on every ordinary pod restart.
+                  # see templates/scaledown-guard-sts-reader.yaml. This hook is
+                  # only rendered when scaleDownGuard.enabled=true, so that
+                  # identity should always be mounted; the check below still
+                  # guards the window during a rollout from a release that
+                  # predates the Secret, and fails toward skipping rather than
+                  # toward draining on every ordinary pod restart.
+                  cli_timeout=10
                   shortName="${FQDN%%.*}"
                   ordinal="${shortName##*-}"
                   stsTokenFile=/run/secrets/kubernetes.io/sts-reader-token/token
                   stsCaFile=/run/secrets/kubernetes.io/sts-reader-token/ca.crt
                   if [[ ! -r "${stsTokenFile}" ]]; then
-                      log "preStop: sts-reader credentials not present (scaleDownGuard.enabled=false); skipping offload by default."
+                      log "preStop: sts-reader credentials not present; skipping offload by default."
                       exit 0
                   fi
-                  stsReplicas=$(timeout ${cli_timeout:-10} curl -sS --cacert "${stsCaFile}" \
+                  stsReplicas=$(timeout ${cli_timeout} curl -sS --cacert "${stsCaFile}" \
                       -H "Authorization: Bearer $(cat "${stsTokenFile}")" \
                       "https://kubernetes.default.svc/apis/apps/v1/namespaces/{{ .Release.Namespace }}/statefulsets/{{ include "apache-nifi.fullname" . }}" \
                       2>/dev/null | jq -r '.spec.replicas // empty')
-                  if [[ -n "${stsReplicas}" ]] && [[ "${ordinal}" -lt "${stsReplicas}" ]]; then
+                  # No answer means either the API server is unreachable or the
+                  # StatefulSet itself is gone (helm uninstall, `kubectl delete
+                  # sts`). Both are cases where every pod is terminating at once
+                  # and there is no healthy peer to offload onto, so treating an
+                  # unknown count as "scale-down" would have the whole cluster
+                  # attempt a full drain against itself. Skip instead: the cost
+                  # of not draining a node that is genuinely going away is that
+                  # its data waits on the retained PVC, which is exactly where
+                  # the drain would have to give up anyway.
+                  if [[ -z "${stsReplicas}" ]]; then
+                      log "preStop: could not read the StatefulSet's desired replica count; cannot distinguish a scale-down from a restart or a teardown, so skipping offload."
+                      exit 0
+                  fi
+                  if [[ "${ordinal}" -lt "${stsReplicas}" ]]; then
                       log "preStop: ordinal ${ordinal} is within current desired replica count (${stsReplicas}); this looks like a restart, not a scale-down. Skipping offload."
                       exit 0
                   fi
-                  log "preStop: ordinal ${ordinal} is at or beyond current desired replica count (${stsReplicas:-unknown}); proceeding as a scale-down."
+                  log "preStop: ordinal ${ordinal} is at or beyond current desired replica count (${stsReplicas}); proceeding as a scale-down."
 
                   log "preStop: draining node '$FQDN'"
                   echo "keystoreType=$(prop nifi.security.keystoreType)" > /tmp/preStop-secure.properties
@@ -472,17 +500,17 @@
                   echo "truststorePasswd=$(prop nifi.security.truststorePasswd)" >> /tmp/preStop-secure.properties
                   echo "proxiedEntity={{ .Values.auth.admin }}" >> /tmp/preStop-secure.properties
                   secureArgs="-p /tmp/preStop-secure.properties"
-                  cli_timeout=10
-                  max_wait=25
+                  stateWait={{ .Values.properties.drainStateWaitSeconds }}
                   drainQueueTimeout={{ .Values.properties.drainQueueTimeoutSeconds }}
                   drainStallLimit={{ .Values.properties.drainQueueStallLimit }}
+                  drain_poll_interval={{ .Values.properties.drainQueuePollSeconds }}
                   baseUrl=https://${FQDN}:{{ .Values.properties.httpsPort }}
 
                   if ! timeout ${cli_timeout} ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > /tmp/preStop-nodes.json; then
                       log "preStop WARNING: get-nodes failed or timed out; skipping drain."
                       exit 0
                   fi
-                  nnid=$(jq --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .nodeId' /tmp/preStop-nodes.json)
+                  nnid=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .nodeId' /tmp/preStop-nodes.json)
                   node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' /tmp/preStop-nodes.json)
                   if [[ "${node_state}" == "OFFLOADED" ]] || [[ -z "${node_state}" ]]; then
                       log "preStop: node already terminal or not found (state='${node_state}'); skipping drain."
@@ -522,27 +550,35 @@
                       return 0
                   }
 
+                  # Poll a peer until this node reports ${1}, updating the shared
+                  # node_state as it goes. Returns non-zero if stateWait elapses
+                  # first, leaving node_state at whatever was last observed.
+                  wait_for_state() {
+                      local target="$1"
+                      local elapsed=0
+                      log "preStop: waiting for ${target} (max ${stateWait}s)"
+                      while [[ "${node_state}" != "${target}" ]] && [[ $elapsed -lt $stateWait ]]; do
+                          sleep 1
+                          elapsed=$((elapsed + 1))
+                          if ! timeout ${cli_timeout} ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > /tmp/preStop-nodes.json.tmp; then
+                              log "preStop WARNING: get-nodes via ${baseUrl} failed or timed out (${elapsed}s). Trying next peer."
+                              next_peer || true
+                              continue
+                          fi
+                          mv /tmp/preStop-nodes.json.tmp /tmp/preStop-nodes.json
+                          node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' /tmp/preStop-nodes.json)
+                          log "preStop: state is '${node_state}' (${elapsed}s) via ${baseUrl}"
+                      done
+                      [[ "${node_state}" == "${target}" ]]
+                  }
+
                   if ! next_peer; then
                       log "preStop WARNING: no peer available after disconnect; skipping offload."
                       exit 0
                   fi
 
-                  log "preStop: waiting for DISCONNECTED (max ${max_wait}s)"
-                  elapsed=0
-                  while [[ "${node_state}" != "DISCONNECTED" ]] && [[ $elapsed -lt $max_wait ]]; do
-                      sleep 1
-                      elapsed=$((elapsed + 1))
-                      if ! timeout ${cli_timeout} ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > /tmp/preStop-nodes.json.tmp; then
-                          log "preStop WARNING: get-nodes via ${baseUrl} failed or timed out (${elapsed}s). Trying next peer."
-                          next_peer || true
-                          continue
-                      fi
-                      mv /tmp/preStop-nodes.json.tmp /tmp/preStop-nodes.json
-                      node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' /tmp/preStop-nodes.json)
-                      log "preStop: state is '${node_state}' (${elapsed}s) via ${baseUrl}"
-                  done
-                  if [[ $elapsed -ge $max_wait ]]; then
-                      log "preStop WARNING: timeout waiting for DISCONNECTED; skipping offload."
+                  if ! wait_for_state DISCONNECTED; then
+                      log "preStop WARNING: timeout waiting for DISCONNECTED (last state '${node_state}'); skipping offload."
                       exit 0
                   fi
 
@@ -558,20 +594,15 @@
                       offload_attempt=$((offload_attempt + 1))
                   done
 
-                  log "preStop: waiting for OFFLOADED (max ${max_wait}s)"
-                  elapsed=0
-                  while [[ "${node_state}" != "OFFLOADED" ]] && [[ $elapsed -lt $max_wait ]]; do
-                      sleep 1
-                      elapsed=$((elapsed + 1))
-                      if ! timeout ${cli_timeout} ${NIFI_TOOLKIT_HOME}/bin/cli.sh nifi get-nodes -ot json -u ${baseUrl} ${secureArgs} > /tmp/preStop-nodes.json.tmp; then
-                          log "preStop WARNING: get-nodes via ${baseUrl} failed or timed out (${elapsed}s). Trying next peer."
-                          next_peer || true
-                          continue
-                      fi
-                      mv /tmp/preStop-nodes.json.tmp /tmp/preStop-nodes.json
-                      node_state=$(jq -r --arg FQDN "$FQDN" '.cluster.nodes[] | select(.address==$FQDN) | .status' /tmp/preStop-nodes.json)
-                      log "preStop: state is '${node_state}' (${elapsed}s) via ${baseUrl}"
-                  done
+                  # Not fatal on its own: the queue-drain poll below is the
+                  # authoritative check on whether removing this node is safe,
+                  # and it reads the node's own local API rather than the
+                  # cluster view, so it stays meaningful even if the cluster
+                  # never published OFFLOADED. Logged so the timeline still
+                  # records that offload didn't visibly take.
+                  if ! wait_for_state OFFLOADED; then
+                      log "preStop WARNING: timeout waiting for OFFLOADED (last state '${node_state}'); offload may not have started. Continuing to the queue-drain check."
+                  fi
 
                   # Reaching OFFLOADED does not mean queued content has actually
                   # finished relocating - for connections without Load Balancing
@@ -590,7 +621,6 @@
                   self_queued=""
                   last_queued=""
                   stall_count=0
-                  drain_poll_interval=10
                   drain_elapsed=0
                   while [[ $drain_elapsed -lt $drainQueueTimeout ]]; do
                       self_queued=""
@@ -649,34 +679,77 @@
 {{- end }}
 {{- end }}
 {{- if .Values.properties.isNode }}
+{{- $rp := .Values.sts.readinessProbe | default dict }}
         readinessProbe:
 {{- if not .Values.sts.startupProbe.enabled  }}
           initialDelaySeconds: 60
 {{- end }}
-          periodSeconds: 20
+          periodSeconds: {{ default 20 $rp.periodSeconds }}
+{{- if $rp.requireClusterConnection }}
+          timeoutSeconds: {{ default 10 $rp.timeoutSeconds }}
+          failureThreshold: {{ default 3 $rp.failureThreshold }}
+          exec:
+            command:
+              - /bin/bash
+              - -c
+              - |
+                # Ready means "joined the cluster", not "the port is open". A
+                # node that has fallen out of the cluster keeps accepting TCP
+                # on this port forever, so a tcpSocket probe reports it healthy
+                # while it does no clustered work at all.
+                set -o pipefail
+                umask 077
+                CRT=/tmp/nifi-probe-crt.pem
+                KEY=/tmp/nifi-probe-key.pem
+                P12=/tmp/nifi-probe.p12
+                CONF="${NIFI_HOME}/conf/nifi.properties"
+                prop() { grep -E "^${1}=" "${CONF}" | cut -d'=' -f2; }
+                KS=$(prop nifi.security.keystore)
+                KSP=$(prop nifi.security.keystorePasswd)
+
+                # curl cannot read a JKS, and the node's identity lives only in
+                # the keystore, so keep a PEM copy alongside it. Regenerated
+                # when absent or older than the keystore, which is what makes a
+                # cert-manager renewal get picked up without a restart. Costs
+                # ~1s on that pass and ~60ms on every other one.
+                if [ ! -s "${CRT}" ] || [ ! -s "${KEY}" ] || [ "${KS}" -nt "${CRT}" ]; then
+                    rm -f "${P12}"
+                    keytool -importkeystore -noprompt \
+                        -srckeystore "${KS}" -srcstoretype JKS -srcstorepass "${KSP}" \
+                        -destkeystore "${P12}" -deststoretype PKCS12 -deststorepass "${KSP}" >/dev/null 2>&1 || exit 1
+                    openssl pkcs12 -in "${P12}" -passin pass:"${KSP}" -nokeys  -out "${CRT}" >/dev/null 2>&1 || exit 1
+                    openssl pkcs12 -in "${P12}" -passin pass:"${KSP}" -nocerts -nodes -out "${KEY}" >/dev/null 2>&1 || exit 1
+                    rm -f "${P12}"
+                fi
+
+                FQDN=$(hostname -f)
+                # This endpoint is reachable by the node's own identity under
+                # this chart's authorizers.xml, and it answers 200 only while
+                # the node is part of a cluster - an unclustered node rejects it
+                # with "Only a node connected to a cluster can process the
+                # request". Both failure modes therefore land on a non-200.
+                code=$(curl -sk --max-time {{ default 5 $rp.curlTimeoutSeconds }} \
+                    --cert "${CRT}" --key "${KEY}" \
+                    -o /tmp/nifi-probe-cluster.json -w '%{http_code}' \
+                    "https://${FQDN}:{{ .Values.properties.httpsPort }}/nifi-api/controller/cluster" 2>/dev/null)
+                if [ "${code}" != "200" ]; then
+                    echo "not ready: /nifi-api/controller/cluster returned ${code} (node is not part of a cluster, or the API is not up yet)"
+                    exit 1
+                fi
+
+                # Being able to read the roster is not the same as being in it:
+                # a DISCONNECTED or OFFLOADING node can still be listed. Require
+                # this node's own entry to say CONNECTED.
+                if ! jq -e --arg F "${FQDN}" \
+                    '[.cluster.nodes[] | select(.address == $F and .status == "CONNECTED")] | length == 1' \
+                    /tmp/nifi-probe-cluster.json >/dev/null 2>&1; then
+                    echo "not ready: this node is not CONNECTED (roster: $(jq -r '[.cluster.nodes[] | "\(.address|split(".")[0])=\(.status)"] | join(" ")' /tmp/nifi-probe-cluster.json 2>/dev/null))"
+                    exit 1
+                fi
+{{- else }}
           tcpSocket:
             port: {{ .Values.properties.httpsPort }}
-#           exec:
-#             command:
-#             - bash
-#             - -c
-#             - |
-# {{- if .Values.properties.httpsPort }}
-#               curl -kv \
-#                 --cert ${NIFI_HOME}/config-data/certs/admin/crt.pem --cert-type PEM \
-#                 --key ${NIFI_HOME}/config-data/certs/admin/key.pem --key-type PEM \
-#                 https://$(hostname -f):{{ .Values.properties.httpsPort }}/nifi-api/controller/cluster > $NIFI_BASE_DIR/data/cluster.state
-# {{- else }}
-#               curl -kv \
-#                 http://$(hostname -f):{{ .Values.properties.httpPort }}/nifi-api/controller/cluster > $NIFI_BASE_DIR/data/cluster.state
-# {{- end }}
-#               STATUS=$(jq -r ".cluster.nodes[] | select((.address==\"$(hostname -f)\") or .address==\"localhost\") | .status" $NIFI_BASE_DIR/data/cluster.state)
-
-#               if [[ ! $STATUS = "CONNECTED" ]]; then
-#                 echo "Node not found with CONNECTED state. Full cluster state:"
-#                 jq . $NIFI_BASE_DIR/data/cluster.state
-#                 exit 1
-#               fi
+{{- end }}
 {{- end }}
 {{- if .Values.sts.startupProbe.enabled }}
         startupProbe:
@@ -685,6 +758,12 @@
           tcpSocket:
             port: {{ .Values.properties.httpsPort }}
 {{- end }}
+        # Deliberately stays a plain TCP check even when readiness is
+        # cluster-aware: losing cluster membership is a reason to stop sending
+        # this node traffic, not a reason to kill it. A node that has dropped
+        # out is usually mid-rejoin, and restarting it would abort that - and on
+        # a whole-cluster disruption would turn a recoverable outage into a
+        # crash loop across every node at once.
         livenessProbe:
 {{- if not .Values.sts.startupProbe.enabled }}
           initialDelaySeconds: 90

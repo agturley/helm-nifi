@@ -46,7 +46,15 @@ spec:
     secretName: {{ template "apache-nifi.fullname" $ }}-ca
 {{- /* if not $useExtIssuer */}}{{ end }}
 ---
-{{ range untilStep 0 (int .Values.replicaCount) 1 }}
+{{/*
+Ranged over the identity pool, not replicaCount, so a node's Certificate is
+already issued and its identity already authorized before that ordinal is ever
+scheduled. Keeping these in step matters most when replicaCount changes without
+a helm upgrade - `kubectl scale` or an HPA, both of which the scaleDownGuard
+policy explicitly matches - where a pod at a new ordinal would otherwise come up
+with an authorizers.xml entry but no certificate, and never reach Ready.
+*/}}
+{{ range untilStep 0 (int (include "nifi.identityPoolSize" $)) 1 }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -80,7 +88,7 @@ spec:
   issuerRef:
 {{ include "apache-nifi.certManagerIssuerRef" $ | indent 4 }}
 ---
-{{/* range untilStep 0 (int .Values.replicaCount ) 1 */}}{{ end }}
+{{/* range untilStep 0 (int (include "nifi.identityPoolSize" $)) 1 */}}{{ end }}
 {{/* if not .Values.certManager.manageCerts */}}{{ end }}
 apiVersion: v1
 kind: ServiceAccount

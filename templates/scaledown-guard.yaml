@@ -1,9 +1,17 @@
 ---
 {{- if .Values.scaleDownGuard.enabled }}
+{{/*
+ValidatingAdmissionPolicy and its Binding are CLUSTER-scoped, so the release
+namespace has to be part of the name: two releases of this chart that resolve to
+the same fullname in different namespaces would otherwise collide on install,
+and the second would either fail or silently adopt the first one's policy - which
+points its matchConditions at the wrong namespace.
+*/}}
+{{- $guardName := printf "%s-%s-scaledown-guard" .Release.Namespace (include "apache-nifi.fullname" .) }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: {{ include "apache-nifi.fullname" . }}-scaledown-guard
+  name: {{ $guardName }}
   labels:
 {{- include "nifi.commonLabels" . | nindent 4 }}
     app: {{ include "apache-nifi.name" . | quote }}
@@ -42,7 +50,7 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: {{ include "apache-nifi.fullname" . }}-scaledown-guard-binding
+  name: {{ $guardName }}-binding
   labels:
 {{- include "nifi.commonLabels" . | nindent 4 }}
     app: {{ include "apache-nifi.name" . | quote }}
@@ -50,6 +58,18 @@ metadata:
     release: {{ .Release.Name | quote }}
     heritage: {{ .Release.Service | quote }}
 spec:
-  policyName: {{ include "apache-nifi.fullname" . }}-scaledown-guard
+  policyName: {{ $guardName }}
+  # The policy's matchConstraints necessarily select every StatefulSet UPDATE in
+  # the cluster (a resourceRule cannot be namespaced), and failurePolicy is Fail,
+  # so without this every such request in every namespace depends on this policy
+  # evaluating cleanly. namespaceSelector narrows that at the API server, before
+  # the matchConditions run, and unlike objectSelector it works for the
+  # statefulsets/scale subresource too - it matches labels on the Namespace
+  # object rather than on the admitted object, and kubernetes.io/metadata.name is
+  # set automatically on every namespace by the API server.
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
   validationActions: ["Deny"]
 {{- end }}

@@ -84,7 +84,11 @@ data:
     # Environment-configurable flags
     ENABLE_MANAGED_GROUPS = os.getenv("ENABLE_MANAGED_GROUPS", "true").lower() in ("1", "true", "yes")
     MONITORING_USER = 'CN={{ template "apache-nifi.fullname" $ }}-monitor{{ include "nifi.nodeOU" $ }}'
-    REPLICA_COUNT = {{ .Values.replicaCount }}
+    # Sized to the identity pool rather than the live replica count, matching
+    # authorizers.xml and the per-node Certificates: node users for reserved
+    # ordinals are created up front and sit inert until that ordinal exists, so
+    # a scale-up never has to wait on a users.xml sync to be authorized.
+    REPLICA_COUNT = {{ include "nifi.identityPoolSize" $ }}
     NODE_USER_TEMPLATE = 'CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" "{i}") }}{{ include "nifi.nodeOU" $ }}'
     {{- if eq (include "nifi.sharedNodeIdentityMappingEnabled" .) "true" }}
     # Shared identity used by all nodes after cert-manager identity mapping.

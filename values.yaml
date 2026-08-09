@@ -108,6 +108,39 @@ sts:
     failureThreshold: 60
     periodSeconds: 10
 
+  readinessProbe:
+    # Make readiness mean "this node has actually joined the NiFi cluster",
+    # rather than the default "port 8443 accepts a TCP connection".
+    #
+    # Only has an effect when properties.isNode is true - a standalone node has
+    # no cluster to join, so it keeps the plain TCP check.
+    #
+    # Why you want this: a node can drop out of the cluster and keep serving its
+    # port indefinitely. With the TCP check it stays Ready and in the Service's
+    # endpoints while doing no clustered work at all, and a rolling update will
+    # happily move on to the next pod because this one "came back". The cluster
+    # check turns that into a visible NotReady, and makes a rolling update wait
+    # for each node to genuinely rejoin before touching the next one.
+    #
+    # Why it is opt-in: it makes rollouts slower (correctly so), and it requires
+    # the node's own certificate identity to be authorized for
+    # GET /nifi-api/controller/cluster. That holds for this chart's own
+    # authorizers.xml, but a deployment with hand-managed authorizations could
+    # find every node wedged NotReady - so verify before enabling in prod.
+    #
+    # Implementation note: the check needs a client certificate, and NiFi keeps
+    # the node identity in a JKS keystore that curl cannot read. The probe
+    # extracts a PEM copy into the container's own /tmp on first run (~1s) and
+    # reuses it (~60ms) until the keystore changes - so cert-manager renewals
+    # are picked up automatically without a restart.
+    requireClusterConnection: false
+    periodSeconds: 20
+    timeoutSeconds: 10
+    # 3 x 20s means a node has ~a minute to re-join before it is pulled from the
+    # Service. Cluster-coordinator re-election alone can take ~15s (see
+    # properties.drainStateWaitSeconds), so do not tighten this much.
+    failureThreshold: 3
+
 ## Useful if using any custom secrets
 ## Pass in some secrets to use (if required)
 # secrets:
@@ -183,11 +216,40 @@ properties:
   # preStop hook polls the node's own local queue count (not the
   # cluster-aggregated view, which can lag) and keeps waiting as long as that
   # count is still going down. It only gives up early if the count stops
-  # improving for drainQueueStallLimit consecutive polls (10s apart), or if
-  # this absolute ceiling is hit first. Raising either eats into the same
-  # budget as terminationGracePeriodSeconds; increase that together with these.
+  # improving for drainQueueStallLimit consecutive polls, or if this absolute
+  # ceiling is hit first.
+  #
+  # These all draw on the SAME budget as terminationGracePeriodSeconds, which
+  # the kubelet applies to preStop and the container's own SIGTERM handling
+  # together. With scaleDownGuard.enabled, the chart refuses to render unless
+  #   terminationGracePeriodSeconds >= 2*drainStateWaitSeconds
+  #                                    + drainQueueTimeoutSeconds
+  #                                    + drainShutdownReserveSeconds
+  # because a grace period below that guarantees the drain is SIGKILLed partway
+  # through - which strands un-relocated content on the PVC with no visible
+  # error. With the defaults below that means terminationGracePeriodSeconds
+  # must be at least 330.
   drainQueueTimeoutSeconds: 180
   drainQueueStallLimit: 6
+  # Seconds to poll between queue-count checks during the drain wait.
+  drainQueuePollSeconds: 10
+  # Per-state ceiling for the DISCONNECTED and OFFLOADED transitions. Counted
+  # twice in the budget above, since both waits can run back to back.
+  #
+  # Sized for cluster-coordinator re-election, not for a healthy round trip.
+  # Scale-down always removes the highest ordinal, which is frequently the
+  # elected coordinator; disconnecting it leaves the cluster leaderless and
+  # every surviving peer rejects `get-nodes` until a new coordinator is elected.
+  # Measured at ~15s on a two-node cluster, and the loop only polls once a
+  # second, so a tight ceiling here means the hook gives up on reaching
+  # DISCONNECTED and skips the offload entirely - stranding queued content with
+  # nothing but a log line to say so. Overshooting costs nothing: the wait exits
+  # the moment the state is observed, so this ceiling is only ever paid on the
+  # path that was going to fail anyway.
+  drainStateWaitSeconds: 60
+  # Headroom left for `nifi.sh stop` after the drain finishes. Only used to
+  # validate terminationGracePeriodSeconds; it is not itself a timeout.
+  drainShutdownReserveSeconds: 30
   webProxyHost: # <clusterIP>:<NodePort> (If Nifi service is NodePort or LoadBalancer)
   clusterPort: 6007
   clusterProtocolIsSecure: true
@@ -1045,13 +1107,20 @@ scaleDownGuard:
   # instead of failing against the guard above. Runs before Helm applies the
   # StatefulSet update; stops one step above the final target and lets that
   # last decrement happen as part of the normal upgrade (which the guard
-  # already allows, since it's a single step). Requires an image with
-  # kubectl on the PATH, reachable from this cluster.
+  # already allows, since it's a single step).
   walkdown:
     enabled: false
+    # Any image with kubectl on the PATH and a POSIX shell will do; the script
+    # avoids bashisms so it runs on minimal (busybox/ash) bases too.
+    #
+    # Not bitnami/kubectl: as of the Bitnami catalog change its only remaining
+    # pullable tag is `latest`, so there is nothing to pin - and an unpinned,
+    # continuously-rebuilt image is a poor thing to gate production upgrades on,
+    # since a broken push becomes a failed `helm upgrade` with the StatefulSet
+    # possibly stranded mid-walkdown.
     image:
-      repository: bitnami/kubectl
-      tag: "latest"
+      repository: alpine/kubectl
+      tag: "1.34.2"
       pullPolicy: IfNotPresent
     # Per-step wait for the StatefulSet to report the new replica count with
     # all remaining pods Ready before proceeding to the next step. A pod being
@@ -1065,8 +1134,14 @@ scaleDownGuard:
     # Extra pause after a step looks stable, before starting the next one -
     # gives the preStop-driven cluster cleanup a moment to fully settle.
     settlePauseSeconds: 15
-    # Overall Job deadline; must be large enough for (steps * (stepTimeout + settlePause)).
-    activeDeadlineSeconds: 1800
+    # Overall Job deadline. Left unset, it is derived from the worst case the
+    # chart can bound at render time:
+    #   ceil((maxReplicaCount - replicaCount) / maxStepDown)
+    #     * (stepTimeoutSeconds + settlePauseSeconds) + 60
+    # Set it explicitly only to override that. Too small a value kills the Job
+    # partway through a legitimate walkdown, which fails the upgrade AND leaves
+    # the StatefulSet at an intermediate replica count.
+    activeDeadlineSeconds:
 
 # ------------------------------------------------------------------------------
 # Zookeeper:

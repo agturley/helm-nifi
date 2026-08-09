@@ -86,6 +86,37 @@ added or removed. Call with the root context ($).
 {{- end -}}
 
 {{/*
+Worst-case seconds the preStop drain hook can consume: the DISCONNECTED wait,
+the OFFLOADED wait, and the queue-drain ceiling. The kubelet's
+terminationGracePeriodSeconds budget covers preStop AND the container's own
+SIGTERM handling, so the pod must be given this much plus headroom for
+`nifi.sh stop` - otherwise the drain is guaranteed to be SIGKILLed partway
+through, stranding un-relocated content on the PVC with no visible error.
+Call with the root context ($).
+*/}}
+{{- define "nifi.drainWorstCaseSeconds" -}}
+{{- $p := .Values.properties -}}
+{{- add (mul 2 (int $p.drainStateWaitSeconds)) (int $p.drainQueueTimeoutSeconds) -}}
+{{- end -}}
+
+{{/*
+Fail rendering when terminationGracePeriodSeconds cannot cover the drain the
+operator has asked for. Only meaningful when scaleDownGuard.enabled, since
+that is what arms the drain in the first place. Call with the root context ($).
+*/}}
+{{- define "nifi.validateDrainBudget" -}}
+{{- if .Values.scaleDownGuard.enabled -}}
+{{- $worst := int (include "nifi.drainWorstCaseSeconds" .) -}}
+{{- $reserve := int (default 30 .Values.properties.drainShutdownReserveSeconds) -}}
+{{- $need := add $worst $reserve -}}
+{{- $have := int .Values.terminationGracePeriodSeconds -}}
+{{- if lt $have $need -}}
+{{- fail (printf "terminationGracePeriodSeconds (%d) is too small for the scale-down drain: the preStop hook can need up to %ds (2 x drainStateWaitSeconds=%d, plus drainQueueTimeoutSeconds=%d) and `nifi.sh stop` needs a further ~%ds. Set terminationGracePeriodSeconds to at least %d, or lower properties.drainQueueTimeoutSeconds / properties.drainStateWaitSeconds." $have $worst (int .Values.properties.drainStateWaitSeconds) (int .Values.properties.drainQueueTimeoutSeconds) $reserve $need) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 issuerRef body for cert-manager Certificate resources.
 When certManager.issuerRef.name is set, reference that existing
 Issuer/ClusterIssuer; otherwise reference the chart-managed CA Issuer.
