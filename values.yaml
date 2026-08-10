@@ -698,6 +698,13 @@ auth:
     userIdentityAttribute: sAMAccountName
     authStrategy: SIMPLE # How the connection to the LDAP server is authenticated. Possible values are ANONYMOUS, SIMPLE, LDAPS, or START_TLS.
     referralStrategy: FOLLOW # How LDAP referrals are handled. Possible values are FOLLOW, IGNORE, or THROW.
+    # How an authenticated user is identified in NiFi:
+    #   USE_DN       - the user's full directory DN (NiFi's default when unset)
+    #   USE_USERNAME - the username they logged in with, i.e. the attribute named
+    #                  by userIdentityAttribute above
+    # This determines the form auth.admin / INITIAL_ADMIN_IDENTITY must take, and
+    # NiFi identities are case-sensitive - see doc/USERMANAGEMENT.md.
+    # `IdentityStrategy` (capital I) is accepted as a legacy alias.
     identityStrategy: USE_DN
     authExpiration: 12 hours
     groupSearchBase: #CN=Users,DC=ldap,DC=example,DC=be   
@@ -722,14 +729,38 @@ auth:
 
   oidc:
     enabled: false
-    discoveryUrl: #http://<oidc_provider_address>:<oidc_provider_port>/auth/realms/<client_realm>/.well-known/openid-configuration
+    # Keycloak: http://<host>:<port>/auth/realms/<realm>/.well-known/openid-configuration
+    # Okta:     https://<org>.okta.com/oauth2/default/.well-known/openid-configuration
+    discoveryUrl:
     clientId: #<client_name_in_oidc_provider>
     clientSecret: #<client_secret_in_oidc_provider>
+    # Which claim in the ID token is the user's NiFi identity.
     claimIdentifyingUser: email
+    # Optional ordered fallbacks if claimIdentifyingUser is absent from the token.
+    fallbackClaimsIdentifyingUser:
+    # Initial admin, expressed as a value of claimIdentifyingUser (so an email
+    # address when that is left at the default). Overridden at runtime by
+    # INITIAL_ADMIN_IDENTITY when a Secret or Vault supplies one.
     admin: nifi@example.com
+    # Leave empty to let NiFi choose (RS256). Set only to force a specific alg.
     preferredJwsAlgorithm:
-    ## Request additional scopes, for example profile
+    ## Scopes requested in addition to `openid`. Accepts a comma-separated
+    ## string or a YAML list.
+    ##
+    ## Usually REQUIRED, and the most common reason an OIDC login "succeeds"
+    ## but NiFi then cannot identify the user: claimIdentifyingUser defaults to
+    ## `email`, and providers only return the email claim when the `email`
+    ## scope was requested. Okta's default authorization server behaves this
+    ## way, so an Okta setup wants at least:
+    ##   additionalScopes: email
+    ## or, to also populate the user's profile and groups:
+    ##   additionalScopes: [profile, email, groups]
     additionalScopes:
+    # ID-token claim carrying the user's groups, used for group-based policies.
+    # `groups` suits Okta and Keycloak conventions, but note that neither emits
+    # it by default - the claim has to be added to the authorization server
+    # first. Change this only if your provider names the claim differently.
+    claimGroups: groups
 
   # Node identity mapping for NiFi authorization.
   # Use this to map per-pod mTLS identities (for example CN=<release>-0, CN=<release>-1)

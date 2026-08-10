@@ -123,13 +123,27 @@ spec:
         imagePullPolicy: {{ .Values.images.nifi.pullPolicy | quote }}
         image: "{{ .Values.images.nifi.repository }}:{{ .Values.images.nifi.tag }}"
         command: ["python3", "/opt/nifi/nifi-sync/scripts/nifi-policysync.py"]
+        {{- if .Values.envFrom }}
+        # Inherited so INITIAL_ADMIN_IDENTITY can come from the same Secret the
+        # other containers read, rather than having to be restated in values.yaml.
+        envFrom:
+{{ toYaml .Values.envFrom | indent 10 }}
+        {{- end }}
         env:
           - name: RESET_AUTH_FILES
             value: {{ .Values.NiFiSync.UserPolicySync.resetAuthFiles | default false | quote }}
-          {{- if (ternary (.Values.auth.ldap.admin | default "") (.Values.auth.admin | default "") .Values.auth.ldap.enabled) }}
-          - name: INITIAL_ADMIN_IDENTITY
-            value: {{ ternary (.Values.auth.ldap.admin | default "") (.Values.auth.admin | default "") .Values.auth.ldap.enabled | quote }}
-          {{- end }}
+          # Deliberately NOT named INITIAL_ADMIN_IDENTITY: an explicit `env`
+          # entry outranks `envFrom` in Kubernetes, so setting that name here
+          # would make values.yaml silently beat the Secret. The script treats
+          # this purely as a fallback for when nothing else supplies one.
+          #
+          # It is also sourced from auth.admin alone. It previously used
+          # `ternary auth.ldap.admin auth.admin auth.ldap.enabled`, which with
+          # LDAP enabled always resolved to the LDAP *bind DN* - an identity no
+          # user ever authenticates as under USE_USERNAME - so policysync seeded
+          # permissions against an account that could never match.
+          - name: INITIAL_ADMIN_IDENTITY_DEFAULT
+            value: {{ .Values.auth.admin | default "" | quote }}
           - name: SECRETS_MODE
             value: {{ include "nifi.effectiveSecretsMode" . | quote }}
           - name: SECRETS_PATH

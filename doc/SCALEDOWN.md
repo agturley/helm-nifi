@@ -219,3 +219,22 @@ data loss.
 `scaleDownGuard.maxStepDown` still defaults to `1` as a conservative default
 regardless, since it caps the blast radius of *any* unexpected scale-down
 behavior, not just the specific race above.
+
+## Related: noticing when a node is *not* in the cluster
+
+Everything above assumes you can tell whether a node is actually clustered. By
+default you cannot: readiness is a TCP check on the HTTPS port, so a node that
+has fallen out of the cluster still reports `Ready` while doing no clustered work
+— which also lets a rolling update proceed to the next pod on the strength of a
+node having merely restarted.
+
+`sts.readinessProbe.requireClusterConnection: true` changes readiness to mean
+"this node has joined the cluster", which surfaces that state as `NotReady` and
+makes a rolling update wait for each node to genuinely rejoin. It composes with
+the drain: during `preStop` the node deliberately disconnects and correctly
+leaves the Service endpoints, while the headless Service's
+`publishNotReadyAddresses: true` keeps peer DNS resolvable so the offload can
+still complete.
+
+See [Cluster-aware readiness](INSTALLATION.md#cluster-aware-readiness-stsreadinessproberequireclusterconnection)
+for the full configuration.

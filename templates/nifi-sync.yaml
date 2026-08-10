@@ -395,7 +395,16 @@ data:
         # Ensure the initial admin identity (from authorizers.xml / Helm auth.admin)
         # always exists in users.xml. NiFi only bootstraps this on a truly fresh
         # start (no users.xml), so policysync must keep it present.
-        initial_admin = os.getenv("INITIAL_ADMIN_IDENTITY", "").strip()
+        # Precedence, lowest last: the secretsMode source loaded above (Vault /
+        # AWS files, or the sourced env file) -> the process environment, i.e.
+        # an envFrom secretRef -> the values.yaml fallback. Keeping the
+        # values.yaml copy under a distinct name is what lets the Secret win,
+        # since a same-named `env` entry would outrank `envFrom` entirely.
+        initial_admin = (
+            os.getenv("INITIAL_ADMIN_IDENTITY")
+            or os.getenv("INITIAL_ADMIN_IDENTITY_DEFAULT")
+            or ""
+        ).strip()
 
         # Detect and remove a stale initial admin when INITIAL_ADMIN_IDENTITY changes.
         # The general purge (removed_users = old_users - current_users) only catches

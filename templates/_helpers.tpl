@@ -117,6 +117,24 @@ that is what arms the drain in the first place. Call with the root context ($).
 {{- end -}}
 
 {{/*
+values.yaml-derived initial admin identity, used as the lowest-precedence
+fallback for ${INITIAL_ADMIN_IDENTITY} (a Secret or Vault value still wins - see
+nifi.secretsInit). Which value is meaningful depends on the active auth mode:
+an OIDC deployment identifies its admin by an IdP claim (auth.oidc.admin, e.g.
+an email address), while every other mode uses auth.admin. This cannot collapse
+to "auth.admin if set" because auth.admin carries a non-empty chart default
+(CN=admin, OU=NIFI), which would silently outrank a real auth.oidc.admin.
+Call with the root context ($).
+*/}}
+{{- define "nifi.initialAdminFallback" -}}
+{{- if .Values.auth.oidc.enabled -}}
+{{- .Values.auth.oidc.admin | default "" -}}
+{{- else -}}
+{{- .Values.auth.admin | default "" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 issuerRef body for cert-manager Certificate resources.
 When certManager.issuerRef.name is set, reference that existing
 Issuer/ClusterIssuer; otherwise reference the chart-managed CA Issuer.
@@ -426,18 +444,27 @@ because that is the only case where containers read files from outputPath.
 {{- if eq $sm "directory" }}
           # ---- secrets: file-dir — load from {{ $sp }}/ ----
           _nifi_sp={{ $sp | quote }}
-          NIFI_TLS_KEYSTORE_PASSWORD=$(tr -d '\r\n' < "$_nifi_sp/NIFI_TLS_KEYSTORE_PASSWORD" 2>/dev/null) || true
-          NIFI_TLS_TRUSTSTORE_PASSWORD=$(tr -d '\r\n' < "$_nifi_sp/NIFI_TLS_TRUSTSTORE_PASSWORD" 2>/dev/null) || true
-          NIFI_SENSITIVE_PROPS_KEY=$(tr -d '\r\n' < "$_nifi_sp/NIFI_SENSITIVE_PROPS_KEY" 2>/dev/null) || true
-          LDAP_MANAGER_DN=$(tr -d '\r\n' < "$_nifi_sp/LDAP_MANAGER_DN" 2>/dev/null) || true
-          LDAP_MANAGER_PASSWORD=$(tr -d '\r\n' < "$_nifi_sp/LDAP_MANAGER_PASSWORD" 2>/dev/null) || true
-          INITIAL_ADMIN_IDENTITY=$(tr -d '\r\n' < "$_nifi_sp/INITIAL_ADMIN_IDENTITY" 2>/dev/null) || true
-          export NIFI_TLS_KEYSTORE_PASSWORD NIFI_TLS_TRUSTSTORE_PASSWORD NIFI_SENSITIVE_PROPS_KEY
-          export LDAP_MANAGER_DN LDAP_MANAGER_PASSWORD INITIAL_ADMIN_IDENTITY
+          # Assign only when the file actually yields a value. A missing or
+          # empty file must fall through to whatever is already in the
+          # environment (an `envFrom` secretRef) and then to the values.yaml
+          # fallback at the end of this block - the previous unconditional
+          # assignment blanked those instead, so a credential supplied by any
+          # route other than this directory was silently wiped.
+          _nifi_load() {
+            _nifi_lv=$(tr -d '\r\n' < "$_nifi_sp/$1" 2>/dev/null) || true
+            if [ -n "$_nifi_lv" ]; then export "$1=$_nifi_lv"; fi
+            unset _nifi_lv
+            return 0
+          }
+          for _nifi_k in NIFI_TLS_KEYSTORE_PASSWORD NIFI_TLS_TRUSTSTORE_PASSWORD \
+                         NIFI_SENSITIVE_PROPS_KEY LDAP_MANAGER_DN \
+                         LDAP_MANAGER_PASSWORD INITIAL_ADMIN_IDENTITY; do
+            _nifi_load "$_nifi_k"
+          done
           {{- if not .Values.NiFiSync.s3Sync.useIRSA }}
-          S3_ACCESS_KEY_ID=$(tr -d '\r\n' < "$_nifi_sp/S3_ACCESS_KEY_ID" 2>/dev/null) || true
-          S3_SECRET_ACCESS_KEY=$(tr -d '\r\n' < "$_nifi_sp/S3_SECRET_ACCESS_KEY" 2>/dev/null) || true
-          export S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY
+          for _nifi_k in S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY; do
+            _nifi_load "$_nifi_k"
+          done
           {{- end }}
           {{- $hasAwsCredSecret := false }}
           {{- if and .Values.VaultNiFiSecrets.enabled (eq (default "" .Values.VaultNiFiSecrets.secretProvider) "vaultSidecar") }}
@@ -465,24 +492,33 @@ because that is the only case where containers read files from outputPath.
           done
           unset _aws_var_file _aws_var_name _aws_var_val
           {{- end }}
-          unset _nifi_sp
-          # ---- end secrets ----
+          unset _nifi_sp _nifi_k
+          # ---- end secrets source (file-dir) ----
 {{- else if eq $sm "singlefile" }}
           # ---- secrets: file-single — source {{ $sp }}/{{ .Values.properties.secretsFile }} ----
           set -a
           . {{ printf "%s/%s" $sp .Values.properties.secretsFile | quote }}
           set +a
-          # ---- end secrets ----
-{{- else }}
-          # ---- secrets: none mode — values from Helm values.yaml ----
-          NIFI_TLS_KEYSTORE_PASSWORD={{ .Values.certManager.keystorePasswd | quote }}
-          NIFI_TLS_TRUSTSTORE_PASSWORD={{ .Values.certManager.truststorePasswd | quote }}
-          NIFI_SENSITIVE_PROPS_KEY={{ .Values.properties.sensitiveKey | quote }}
-          LDAP_MANAGER_DN={{ .Values.auth.ldap.admin | default "" | quote }}
-          LDAP_MANAGER_PASSWORD={{ .Values.auth.ldap.pass | default "" | quote }}
-          INITIAL_ADMIN_IDENTITY={{ .Values.auth.admin | default "" | quote }}
+          # ---- end secrets source (file-single) ----
+{{- end }}
+          # ---- values.yaml fallback (applies in every secretsMode) ----
+          # Precedence, lowest last:
+          #   1. the mode-specific source above (Vault / AWS files, or the
+          #      single sourced env file)
+          #   2. the process environment - typically an `envFrom` secretRef
+          #   3. these values.yaml literals
+          # Assigned via a temporary rather than inlining the literal into
+          # ${VAR:-...} so that values containing braces or quotes cannot break
+          # out of the expansion. Kept POSIX (no ${!name}, no `local`) because
+          # this block is also emitted into the /bin/sh s3-sync container.
+          _d={{ .Values.certManager.keystorePasswd | quote }};       NIFI_TLS_KEYSTORE_PASSWORD="${NIFI_TLS_KEYSTORE_PASSWORD:-$_d}"
+          _d={{ .Values.certManager.truststorePasswd | quote }};     NIFI_TLS_TRUSTSTORE_PASSWORD="${NIFI_TLS_TRUSTSTORE_PASSWORD:-$_d}"
+          _d={{ .Values.properties.sensitiveKey | quote }};          NIFI_SENSITIVE_PROPS_KEY="${NIFI_SENSITIVE_PROPS_KEY:-$_d}"
+          _d={{ .Values.auth.ldap.admin | default "" | quote }};     LDAP_MANAGER_DN="${LDAP_MANAGER_DN:-$_d}"
+          _d={{ .Values.auth.ldap.pass | default "" | quote }};      LDAP_MANAGER_PASSWORD="${LDAP_MANAGER_PASSWORD:-$_d}"
+          _d={{ include "nifi.initialAdminFallback" . | quote }};          INITIAL_ADMIN_IDENTITY="${INITIAL_ADMIN_IDENTITY:-$_d}"
+          unset _d
           export NIFI_TLS_KEYSTORE_PASSWORD NIFI_TLS_TRUSTSTORE_PASSWORD NIFI_SENSITIVE_PROPS_KEY
           export LDAP_MANAGER_DN LDAP_MANAGER_PASSWORD INITIAL_ADMIN_IDENTITY
           # ---- end secrets ----
-{{- end -}}
 {{- end -}}

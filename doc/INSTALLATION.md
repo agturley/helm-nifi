@@ -7,23 +7,35 @@ Installation
 1. **Clone the repo**
 
 ```bash
-git clone https://github.com/cetic/helm-nifi.git
+git clone https://github.com/agturley/helm-nifi.git
 cd helm-nifi
+```
+
+The chart has exactly one dependency — the optional ZooKeeper subchart — and a
+copy is already vendored under `charts/`, so no repositories need to be added
+for a normal install. Only refresh it if you actually intend to run ZooKeeper
+and want a newer version than the vendored one:
+
+```bash
 helm repo add bitnami https://charts.bitnami.com/bitnami
-helm repo add dysnix https://dysnix.github.io/charts/
 helm repo update
 helm dep up
 ```
+
+Most NiFi 2.x deployments skip ZooKeeper entirely and use Kubernetes Leases for
+leader election instead — see
+[Kubernetes-Native Cluster State](#kubernetes-native-cluster-state-kubernetesclusterstate--nifi-2x).
+
 2. **Set a sensitiveKey and configure credential management**
 
-NiFi (current chart: `image.tag: "2.11.0"`) requires a `sensitiveKey` (minimum 12 characters) to encrypt sensitive flow data. Set it in `values.yaml`:
+NiFi (current chart: `images.nifi.tag: "2.11.0"`) requires a `sensitiveKey` (minimum 12 characters) to encrypt sensitive flow data. Set it in `values.yaml`:
 
 ````
 properties:
   sensitiveKey: "changeMechangeMe"  # minimum 12 characters
 ````
 
-The `secretsMode` property controls how the container reads runtime credentials at startup. See [Credential Management](#credential-management-propertiessecreatsmode) for available modes (`none`, `file-dir`, `file-single`).
+The `secretsMode` property controls how the container reads runtime credentials at startup. See [Credential Management](#credential-management-propertiessecretsmode) for available modes (`none`, `file-dir`, `file-single`).
 
 3. **Configure a user authentication**
 
@@ -199,6 +211,94 @@ properties:
   secretsFile: "credentials.env"       # filename for file-single mode
 ```
 
+### Precedence
+
+`secretsMode` selects a *source*, it does not make that source exclusive. At
+startup each credential is resolved in this order, highest first:
+
+1. **the `secretsMode` source** — the Vault/AWS file for `file-dir`, or the
+   sourced env file for `file-single`
+2. **the process environment** — normally an `envFrom` secretRef on the pod
+3. **`values.yaml`** — the literal, used only when nothing above supplied a value
+
+So `envFrom` and `secretsMode` compose rather than conflict, and a credential
+present in a Secret does not also have to be restated in `values.yaml`. A file
+that is missing or empty falls through to the next source instead of blanking
+the value.
+
+These are the keys resolved this way:
+
+| Key | `values.yaml` fallback |
+|---|---|
+| `NIFI_TLS_KEYSTORE_PASSWORD` | `certManager.keystorePasswd` |
+| `NIFI_TLS_TRUSTSTORE_PASSWORD` | `certManager.truststorePasswd` |
+| `NIFI_SENSITIVE_PROPS_KEY` | `properties.sensitiveKey` |
+| `LDAP_MANAGER_DN` | `auth.ldap.admin` |
+| `LDAP_MANAGER_PASSWORD` | `auth.ldap.pass` |
+| `INITIAL_ADMIN_IDENTITY` | `auth.admin`, or `auth.oidc.admin` when OIDC is enabled |
+
+Supplying them from a Secret in `none` mode needs nothing beyond `envFrom`:
+
+```yaml
+envFrom:
+  - secretRef:
+      name: nifi-secrets
+```
+
+See [Initial admin identity](USERMANAGEMENT.md#initial-admin-identity) for how
+this interacts with seeding the NiFi administrator.
+
+---
+
+## Cluster-aware readiness (`sts.readinessProbe.requireClusterConnection`)
+
+By default readiness is a TCP check on the HTTPS port. That answers "is the
+process listening", which is not the same question as "is this node doing any
+clustered work" — a node can drop out of the NiFi cluster and keep accepting
+connections on that port indefinitely. It stays in the Service's endpoints
+serving requests it cannot fulfil, and a rolling update moves on to the next pod
+because this one "came back".
+
+```yaml
+sts:
+  readinessProbe:
+    requireClusterConnection: true   # default: false
+    periodSeconds: 20
+    timeoutSeconds: 10
+    failureThreshold: 3
+```
+
+When enabled, readiness instead calls `GET /nifi-api/controller/cluster` on the
+node itself and requires the node's **own** entry to report `CONNECTED`. Both
+failure modes are covered: a node that has left the cluster rejects that endpoint
+outright, and a node still listed as `DISCONNECTED`/`OFFLOADING` fails the status
+check. The probe prints the full cluster roster when it fails, so
+`kubectl describe pod` shows why.
+
+Only applies when `properties.isNode: true` — a standalone node has no cluster to
+join and keeps the TCP check.
+
+**Liveness deliberately stays a TCP check.** Losing cluster membership is a
+reason to stop sending a node traffic, not a reason to restart it: a node that
+has dropped out is usually mid-rejoin, and a cluster-aware liveness probe would
+turn a cluster-wide disruption into a simultaneous crash loop on every node.
+
+Two consequences worth planning for:
+
+- **Rolling updates get slower, deliberately.** Each pod must genuinely rejoin
+  before the next is touched, which is the behaviour that prevents a rollout from
+  silently leaving a node stranded outside the cluster.
+- **It depends on authorization.** The check authenticates with the node's own
+  certificate, which must be allowed to call `/nifi-api/controller/cluster`. That
+  holds for the `authorizers.xml` this chart generates; a deployment with
+  hand-managed authorizations should verify it before enabling, or every node
+  will sit `NotReady`.
+
+The probe needs a client certificate and NiFi keeps the node identity in a JKS
+that `curl` cannot read, so it extracts a PEM copy into the container's own
+`/tmp` on first run and reuses it, regenerating whenever the keystore is newer.
+cert-manager renewals are therefore picked up without a restart.
+
 ---
 
 ## JVM Tuning (`jvm`)
@@ -227,8 +327,8 @@ When `certManager.enabled: true`, the chart creates a self-signed CA chain and p
 certManager:
   enabled: false
   manageCerts: true             # set false to supply TLS secrets manually
-  keystorePasswd: "changeme"
-  truststorePasswd: "changeme"
+  keystorePasswd: "keystorePasswd"      # placeholder default — override this
+  truststorePasswd: "truststorePasswd"  # placeholder default — override this
   useMergedCACerts: true        # merge JVM cacerts + chart CAs into one truststore
   caDuration: 87660h            # CA lifetime (10 years)
   certDuration: 2160h           # node cert lifetime (90 days)
@@ -292,21 +392,33 @@ When using `secretsMode: file-dir`, point `flattenTo` at `properties.secretsFile
 
 ```yaml
 VaultNiFiSecrets:
-  secretProvider: vaultSecretOperator   # vaultSecretOperator | vaultSidecar
+  secretProvider: vaultSidecar          # vaultSidecar (default) | vaultSecretOperator
   enabled: false
-  defaultSecretAddress: ""
-  defaultAuthPath: ""
-  defaultMount: ""
-  defaultNamespace: ""
-  defaultRole: ""
-  defaultPath: ""
+  defaultSecretAddress: ""              # Vault server URL
   defaultContainerPath: /opt/nifi/secrets
-  defaultKvVersion: 2                  # default KV engine version: 1 | 2
-  defaultSecretMode: directory          # file | directory | aws-credential
-  secrets:
+  defaultKvVersion: 2                   # default KV engine version: 1 | 2
+  defaultSecretMode: directory          # directory | singlefile | aws-credential
+
+  vaultSidecar:                         # only used when secretProvider: vaultSidecar
+    image: ""
+    installPackages: false              # false when the image already has the deps
+    skipTlsVerify: false
+    caSecretName: ""                    # defaults to the first top-level caSecrets entry
+    syncMode: interval                  # interval | once
+    syncInterval: 10                    # minutes
+
+  secrets:                              # each entry may override the defaults above
     - name: nifi-secrets
-      # kvVersion: 1                    # optional per-secret override
+      # mount: secret                   # Vault mount
+      # path: nifi/database             # path within the mount
+      # secretMode: directory           # directory | singlefile | aws-credential
+      # outputFile: db-credentials
+      # kvVersion: 1                    # aws-credential defaults to 1 when omitted
 ```
+
+Scope is per secret, not global: `mount`, `path`, `secretMode`, `outputFile` and
+`kvVersion` are set on individual `secrets[]` entries, and the top-level
+`default*` keys only supply the fallback for entries that omit them.
 
 `aws-credential` mode reads standard AWS key aliases from a Vault secret and writes
 an AWS credentials file under `<containerPath>/.aws/<secret-name>/credentials`, plus

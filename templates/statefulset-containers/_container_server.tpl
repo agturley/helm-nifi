@@ -149,13 +149,17 @@
           xmlstarlet ed --inplace --delete "//authorizers/authorizer[identifier='single-user-authorizer']" "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//authorizers/userGroupProvider/property[@name='Users File']" -v './auth-conf/users.xml' "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --delete "//authorizers/userGroupProvider/property[@name='Initial User Identity 1']" "${NIFI_HOME}/conf/authorizers.xml"
+          # ${INITIAL_ADMIN_IDENTITY} rather than the values.yaml literal, so an
+          # identity delivered by a Secret or Vault wins here exactly as it does
+          # on the LDAP path. nifi.secretsInit resolves it, falling back to
+          # auth.oidc.admin when nothing else supplies one.
           xmlstarlet ed --inplace \
                         --subnode "authorizers/userGroupProvider" --type 'elem' -n 'property' \
-                          --value {{ .Values.auth.oidc.admin | quote }} \
+                          --value "${INITIAL_ADMIN_IDENTITY}" \
                         --insert "authorizers/userGroupProvider/property[not(@name)]" --type attr -n name \
                           --value "Initial User Identity {{ include "nifi.identityPoolSize" $ }}" \
                         "${NIFI_HOME}/conf/authorizers.xml"
-          xmlstarlet ed --inplace --update "//authorizers/accessPolicyProvider/property[@name='Initial Admin Identity']" -v {{ .Values.auth.oidc.admin | quote }} "${NIFI_HOME}/conf/authorizers.xml"
+          xmlstarlet ed --inplace --update "//authorizers/accessPolicyProvider/property[@name='Initial Admin Identity']" -v "${INITIAL_ADMIN_IDENTITY}" "${NIFI_HOME}/conf/authorizers.xml"
           xmlstarlet ed --inplace --update "//authorizers/accessPolicyProvider/property[@name='Authorizations File']" -v './auth-conf/authorizations.xml' "${NIFI_HOME}/conf/authorizers.xml"
           {{- if .Values.properties.isNode }}
                       xmlstarlet ed --inplace --delete "authorizers/accessPolicyProvider/property[@name='Node Identity 1']" "${NIFI_HOME}/conf/authorizers.xml"

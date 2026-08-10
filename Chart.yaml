@@ -10,8 +10,8 @@ keywords:
   - process
 home: https://nifi.apache.org/
 icon: https://svn.apache.org/repos/asf/nifi/site/trunk/images/niFi-logo-horizontal-scaled.png
-source:
-  - https://github.com/cetic/helm-nifi
+sources:
+  - https://github.com/agturley/helm-nifi
 maintainers:
   - name: aturley
     email: agturley@gmail.com

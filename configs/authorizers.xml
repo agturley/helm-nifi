@@ -54,11 +54,8 @@
         <property name="Initial User Identity {{ $i }}">CN={{ include "nifi.nodeCN" (dict "ctx" $ "node" $i) }}{{ include "nifi.nodeOU" $ }}</property>
         {{- end }}
         {{- end }}
-        {{- if and .Values.auth.ldap.enabled (not .Values.auth.admin) }}
-        <property name="Initial User Identity admin">{{.Values.auth.ldap.admin}}</property>
-        {{- else }}
+        {{- /* auth.admin only - see the Initial Admin Identity note below. */}}
         <property name="Initial User Identity admin">{{ .Values.auth.admin }}</property>
-        {{- end}}
     </userGroupProvider>
     <!--
         The LdapUserGroupProvider will retrieve users and groups from an LDAP server. The users and groups
@@ -276,15 +273,21 @@
         <property name="User Group Provider">file-user-group-provider</property>
 {{- end}}
         <property name="Authorizations File">./auth-conf/authorizations.xml</property>
-        {{- if and .Values.auth.ldap.enabled (not .Values.auth.admin) }}
-        <property name="Initial Admin Identity">{{.Values.auth.ldap.admin}}</property>
-        {{- else }}
+        {{- /*
+        Always auth.admin, never auth.ldap.admin. The previous fallback used the
+        LDAP *bind DN* whenever auth.admin was empty, which is not an identity
+        any user authenticates as under USE_USERNAME. When LDAP is enabled the
+        server container overwrites this at startup from ${INITIAL_ADMIN_IDENTITY},
+        so a Secret- or Vault-supplied identity wins and leaving auth.admin unset
+        here is fine.
+        Flattening the old if/else also fixes two latent bugs: the composite
+        User Group Provider below was only emitted in the else branch, so an
+        empty auth.admin silently dropped it, and the semverCompare wrapped
+        around it had an empty body and did nothing at all.
+        */}}
         <property name="Initial Admin Identity">{{ .Values.auth.admin }}</property>
-{{- if semverCompare "> 2.0.0-0" .Values.images.nifi.tag }}
-        {{- end}}
-        {{- if and .Values.auth.ldap.enabled }}
+        {{- if .Values.auth.ldap.enabled }}
         <property name="User Group Provider">composite-configurable-user-group-provider</property>
-{{- end}}
         {{- end}}
         <property name="Legacy Authorized Users File"></property>
         {{- if eq (include "nifi.sharedNodeIdentityMappingEnabled" $) "true" }}
